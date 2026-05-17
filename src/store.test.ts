@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
-import type { StoredImage, StoredImageThumbnail, TaskRecord } from './types'
+import type { AgentConversation, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
@@ -50,11 +50,42 @@ vi.mock('./lib/db', () => {
     },
   }
 })
+vi.mock('./lib/api', () => ({
+  callImageApi: vi.fn(async () => ({
+    images: [],
+    actualParams: {},
+    actualParamsList: [],
+    revisedPrompts: [],
+  })),
+}))
 import { clearImages, putImage } from './lib/db'
-import { editOutputs, getPersistedState, getTaskApiProfile, markInterruptedOpenAIRunningTasks, reuseConfig, submitTask, useStore } from './store'
+import { editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, markInterruptedOpenAIRunningTasks, reuseConfig, submitTask, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
+
+describe('error toast messages', () => {
+  it('drops long error detail after the failure title', () => {
+    expect(getErrorToastMessage('Agent 请求失败：接口拒绝了很长的提示词内容')).toBe('Agent 请求失败')
+  })
+
+  it('uses a generic message for long raw errors without a title', () => {
+    expect(getErrorToastMessage(`invalid request ${'x'.repeat(90)}`)).toBe('操作失败，请查看详情')
+  })
+})
+
+function agentConversation(overrides: Partial<AgentConversation> = {}): AgentConversation {
+  return {
+    id: 'conversation-a',
+    title: '新对话',
+    activeRoundId: null,
+    createdAt: 1,
+    updatedAt: 1,
+    rounds: [],
+    messages: [],
+    ...overrides,
+  }
+}
 
 function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -124,6 +155,14 @@ describe('mask draft lifecycle in store actions', () => {
     await submitTask()
 
     expect(useStore.getState().maskDraft).toBeNull()
+  })
+
+  it('shows a submitted toast after creating a gallery task', async () => {
+    await submitTask()
+
+    const state = useStore.getState()
+    expect(state.tasks).toHaveLength(1)
+    expect(state.showToast).toHaveBeenCalledWith('任务已提交', 'success')
   })
 
   it('preserves selected image mentions when replacing a mask target with an equivalent image id', () => {
@@ -207,6 +246,80 @@ describe('input persistence setting', () => {
 
     expect(persisted.prompt).toBe('')
     expect(persisted.inputImages).toEqual([])
+  })
+})
+
+describe('agent conversation creation', () => {
+  beforeEach(() => {
+    useStore.setState({
+      agentConversations: [],
+      activeAgentConversationId: null,
+      agentSidebarCollapsed: false,
+      agentEditingRoundId: null,
+    })
+  })
+
+  it('refreshes the latest empty conversation instead of creating another one', () => {
+    const olderEmpty = agentConversation({ id: 'older-empty', createdAt: 1_000, updatedAt: 1_000 })
+    const latestEmpty = agentConversation({ id: 'latest-empty', createdAt: 2_000, updatedAt: 2_000 })
+    const now = vi.spyOn(Date, 'now').mockReturnValue(3_000)
+    useStore.setState({
+      agentConversations: [olderEmpty, latestEmpty],
+      activeAgentConversationId: olderEmpty.id,
+      agentSidebarCollapsed: false,
+      agentEditingRoundId: 'editing-round',
+    })
+
+    const id = useStore.getState().createAgentConversation()
+
+    const state = useStore.getState()
+    expect(id).toBe(latestEmpty.id)
+    expect(state.activeAgentConversationId).toBe(latestEmpty.id)
+    expect(state.agentConversations).toHaveLength(2)
+    expect(state.agentConversations.find((item) => item.id === latestEmpty.id)).toMatchObject({
+      createdAt: 3_000,
+      updatedAt: 3_000,
+    })
+    expect(state.agentConversations.find((item) => item.id === olderEmpty.id)).toEqual(olderEmpty)
+    expect(state.agentSidebarCollapsed).toBe(true)
+    expect(state.agentEditingRoundId).toBeNull()
+    now.mockRestore()
+  })
+
+  it('creates a new conversation when the latest conversation has messages', () => {
+    const olderEmpty = agentConversation({ id: 'older-empty', createdAt: 1_000, updatedAt: 1_000 })
+    const latestUsed = agentConversation({
+      id: 'latest-used',
+      activeRoundId: 'round-a',
+      createdAt: 2_000,
+      updatedAt: 2_000,
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'message-a',
+        prompt: 'prompt',
+        inputImageIds: [],
+        outputTaskIds: [],
+        status: 'done',
+        error: null,
+        createdAt: 2_000,
+        finishedAt: 2_000,
+      }],
+      messages: [{ id: 'message-a', role: 'user', content: 'prompt', roundId: 'round-a', createdAt: 2_000 }],
+    })
+    const now = vi.spyOn(Date, 'now').mockReturnValue(3_000)
+    useStore.setState({ agentConversations: [olderEmpty, latestUsed], activeAgentConversationId: latestUsed.id })
+
+    const id = useStore.getState().createAgentConversation()
+
+    const state = useStore.getState()
+    expect(id).not.toBe(olderEmpty.id)
+    expect(id).not.toBe(latestUsed.id)
+    expect(state.agentConversations).toHaveLength(3)
+    expect(state.agentConversations[state.agentConversations.length - 1]).toMatchObject({ id, createdAt: 3_000, updatedAt: 3_000, messages: [], rounds: [] })
+    expect(state.activeAgentConversationId).toBe(id)
+    now.mockRestore()
   })
 })
 

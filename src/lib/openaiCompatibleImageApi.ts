@@ -93,6 +93,7 @@ function createResponsesImageTool(
     action: isEdit ? 'edit' : 'generate',
     size: params.size,
     output_format: params.output_format,
+    moderation: params.moderation,
   }
 
   if (!profile.codexCli) {

@@ -8,7 +8,8 @@ import { ActualValueBadge, DetailParamValue } from '../lib/paramDisplay'
 import { copyBlobToClipboard, copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
-import { CloseIcon, CodeIcon, CopyIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
+import { downloadImageIds } from '../lib/downloadImages'
+import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
 
@@ -177,6 +178,10 @@ export default function DetailModal() {
 
   if (!task) return null
 
+  const isAgentTask = task.sourceMode === 'agent' || Boolean(task.agentConversationId || task.agentRoundId)
+  const isAgentEditTool = task.status === 'done' && String(task.agentToolAction ?? '').toLowerCase() === 'edit'
+  const showReferenceSection = allInputImageIds.length > 0 || isAgentEditTool
+
   const outputLen = task.outputImages?.length || 0
   const currentImageRatio = currentOutputImageId ? imageRatios[currentOutputImageId] : ''
   const currentImageSize = currentOutputImageId ? imageSizes[currentOutputImageId] : ''
@@ -287,6 +292,42 @@ export default function DetailModal() {
     }
   }
 
+  const handleDownloadCurrentOutput = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!currentOutputImageId) return
+
+    try {
+      showToast('开始下载...', 'info')
+      const result = await downloadImageIds([currentOutputImageId], `image-${Date.now()}`)
+      if (result.successCount === 0) {
+        showToast('下载失败', 'error')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('下载失败', 'error')
+    }
+  }
+
+  const handleDownloadAllOutputs = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!task.outputImages?.length) return
+
+    try {
+      showToast(task.outputImages.length > 1 ? `开始下载 ${task.outputImages.length} 张图片...` : '开始下载', 'info')
+      const result = await downloadImageIds(task.outputImages, `task-${task.id}-outputs`)
+      if (result.successCount === 0) {
+        showToast('下载失败', 'error')
+      } else if (result.failCount > 0) {
+        showToast(`下载完成：成功 ${result.successCount}，失败 ${result.failCount}`, 'info')
+      } else {
+        showToast(task.outputImages.length > 1 ? `已开始下载 ${result.successCount} 张图片` : '开始下载', 'success')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('下载失败', 'error')
+    }
+  }
+
   const handleRetry = () => {
     retryTask(task)
     setDetailTaskId(null)
@@ -316,6 +357,28 @@ export default function DetailModal() {
 
         {/* 左侧：图片 */}
         <div ref={imagePanelRef} className="md:w-1/2 w-full h-64 md:h-auto bg-gray-100 dark:bg-black/20 relative flex items-center justify-center flex-shrink-0 min-h-[16rem]">
+          {task.status === 'done' && outputLen > 0 && (
+            <div className="absolute right-3 top-[15px] z-20 flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={handleDownloadCurrentOutput}
+                className="flex items-center gap-1 bg-black/50 text-white text-xs px-2 py-0.5 rounded backdrop-blur-sm font-medium hover:bg-black/70 transition focus:outline-none focus:ring-1 focus:ring-white/50"
+              >
+                <DownloadIcon className="h-3.5 w-3.5" />
+                下载图片
+              </button>
+              {outputLen > 1 && (
+                <button
+                  type="button"
+                  onClick={handleDownloadAllOutputs}
+                  className="flex items-center gap-1 bg-black/50 text-white text-xs px-2 py-0.5 rounded backdrop-blur-sm font-medium hover:bg-black/70 transition focus:outline-none focus:ring-1 focus:ring-white/50"
+                >
+                  <DownloadIcon className="h-3.5 w-3.5" />
+                  下载全部
+                </button>
+              )}
+            </div>
+          )}
           {task.status === 'done' && outputLen > 0 && currentOutputPreviewSrc && (
             <>
               <img
@@ -434,7 +497,7 @@ export default function DetailModal() {
                 style={{
                   display: '-webkit-box',
                   WebkitBoxOrient: 'vertical',
-                  WebkitLineClamp: 4,
+                  WebkitLineClamp: 10,
                 }}
               >
                 {task.error || '生成失败'}
@@ -581,50 +644,65 @@ export default function DetailModal() {
             )}
 
             {/* 参考图 */}
-            {allInputImageIds.length > 0 && (
+            {showReferenceSection && (
               <div className="mb-4">
                 <div className="flex items-center gap-1.5 mb-2">
                   <h3 className="text-xs font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
                     参考图
                   </h3>
-                  <button
-                    onClick={handleCopyInputImage}
-                    className="p-1 rounded text-gray-400 hover:bg-gray-100 dark:text-gray-500 dark:hover:bg-white/[0.06] transition"
-                    title="复制参考图"
-                  >
-                    <CopyIcon className="h-4 w-4" />
-                  </button>
+                  {allInputImageIds.length > 0 && (
+                    <button
+                      onClick={handleCopyInputImage}
+                      className="p-1 rounded text-gray-400 hover:bg-gray-100 dark:text-gray-500 dark:hover:bg-white/[0.06] transition"
+                      title="复制参考图"
+                    >
+                      <CopyIcon className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
-                <div className="flex gap-2 flex-wrap">
-                  {allInputImageIds.map((imgId) => {
-                    const isMaskTarget = imgId === maskTargetId
-                    const displaySrc = (isMaskTarget && maskPreviewSrc) ? maskPreviewSrc : (imageSrcs[imgId] || '')
-                    return (
-                      <div key={imgId} className="relative group inline-block">
-                        <div
-                          className={`relative w-16 h-16 rounded-lg overflow-hidden border cursor-pointer hover:opacity-80 transition ${
-                            isMaskTarget ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
-                          }`}
-                          onClick={() => setLightboxImageId(imgId, allInputImageIds)}
-                        >
-                          {displaySrc && (
-                            <img
-                              src={displaySrc}
-                              data-image-id={imgId}
-                              className="w-full h-full object-cover"
-                              alt=""
-                            />
-                          )}
-                          {isMaskTarget && (
-                            <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
-                              MASK
-                            </span>
-                          )}
-                        </div>
+                {allInputImageIds.length > 0 ? (
+                  <>
+                    <div className="flex gap-2 flex-wrap">
+                      {allInputImageIds.map((imgId) => {
+                        const isMaskTarget = imgId === maskTargetId
+                        const displaySrc = (isMaskTarget && maskPreviewSrc) ? maskPreviewSrc : (imageSrcs[imgId] || '')
+                        return (
+                          <div key={imgId} className="relative group inline-block">
+                            <div
+                              className={`relative w-16 h-16 rounded-lg overflow-hidden border cursor-pointer hover:opacity-80 transition ${
+                                isMaskTarget ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
+                              }`}
+                              onClick={() => setLightboxImageId(imgId, allInputImageIds)}
+                            >
+                              {displaySrc && (
+                                <img
+                                  src={displaySrc}
+                                  data-image-id={imgId}
+                                  className="w-full h-full object-cover"
+                                  alt=""
+                                />
+                              )}
+                              {isMaskTarget && (
+                                <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
+                                  MASK
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                    {isAgentEditTool && (
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        由模型自主选择，可能包含其他图片
                       </div>
-                    )
-                  })}
-                </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
+                    由模型自主选择
+                  </div>
+                )}
               </div>
             )}
 
@@ -661,11 +739,13 @@ export default function DetailModal() {
                 <br />
                 <DetailParamValue task={task} paramKey="moderation" className="font-medium" actualParams={currentActualParams} />
               </div>
-              <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
-                <span className="text-gray-400 dark:text-gray-500">数量</span>
-                <br />
-                <DetailParamValue task={task} paramKey="n" className="font-medium" />
-              </div>
+              {!isAgentTask && (
+                <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
+                  <span className="text-gray-400 dark:text-gray-500">数量</span>
+                  <br />
+                  <DetailParamValue task={task} paramKey="n" className="font-medium" />
+                </div>
+              )}
               {task.params.output_compression != null && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                   <span className="text-gray-400 dark:text-gray-500">压缩率</span>

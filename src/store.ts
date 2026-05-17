@@ -12,9 +12,10 @@ import type {
   MaskDraft,
   TaskRecord,
   ExportData,
+  ResponsesOutputItem,
 } from './types'
 import { DEFAULT_PARAMS } from './types'
-import { DEFAULT_IMAGES_MODEL, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, getActiveApiProfile, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
+import { DEFAULT_SETTINGS, getActiveApiProfile, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
 import { dismissAllTooltips } from './lib/tooltipDismiss'
 import { remapImageMentionsForOrder, replaceImageMentionsForApi } from './lib/promptImageMentions'
 import {
@@ -35,7 +36,8 @@ import {
   storeImage,
 } from './lib/db'
 import { callImageApi } from './lib/api'
-import { callAgentResponsesApi, type AgentApiMessage } from './lib/agentApi'
+import { callAgentResponsesApi } from './lib/agentApi'
+import { collectAgentRoundOutputImages, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
 import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
 import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
@@ -62,7 +64,37 @@ const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const agentRoundControllers = new Map<string, AbortController>()
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
+const AGENT_STOPPED_MESSAGE = '已停止生成。'
+const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
+const ERROR_TOAST_MAX_LENGTH = 80
+type ToastType = 'info' | 'success' | 'error'
+
+export function getErrorToastMessage(message: string): string {
+  const text = message.trim()
+  if (!text) return '操作失败'
+
+  const firstLine = text.split(/\r?\n/)[0]?.trim() ?? ''
+  const separatorIndex = firstLine.search(/[：:]/)
+  if (separatorIndex > 0) {
+    const title = firstLine.slice(0, separatorIndex).trim()
+    if (isErrorToastTitle(title)) return title
+  }
+
+  if (firstLine.length > ERROR_TOAST_MAX_LENGTH) return '操作失败，请查看详情'
+  return firstLine || '操作失败'
+}
+
+function getToastMessage(message: string, type: ToastType): string {
+  return type === 'error' ? getErrorToastMessage(message) : message
+}
+
+function isErrorToastTitle(title: string): boolean {
+  return /(?:失败|错误|异常|报错|无法|不能|超时|中断|断开|请先|请输入|已达上限|不存在|已丢失)$/.test(title)
+}
+
+export type SettingsTab = 'general' | 'api' | 'data' | 'about'
 
 function createOpenAITimeoutError(timeoutSeconds: number) {
   return `请求超时：超过 ${timeoutSeconds} 秒仍未完成，请稍后重试或提高超时时间。`
@@ -268,8 +300,12 @@ function orderImagesWithMaskFirst(images: InputImage[], maskTargetImageId: strin
   return next
 }
 
+function isAgentTask(task: TaskRecord) {
+  return task.sourceMode === 'agent' || Boolean(task.agentConversationId || task.agentRoundId)
+}
+
 function countSuccessfulOutputImages(tasks: TaskRecord[]) {
-  return tasks.reduce((count, task) => count + (task.status === 'done' ? task.outputImages.length : 0), 0)
+  return tasks.reduce((count, task) => count + (task.status === 'done' && !isAgentTask(task) ? task.outputImages.length : 0), 0)
 }
 
 function skipSupportPromptForImportedData(tasks: TaskRecord[]) {
@@ -311,30 +347,125 @@ function maybeOpenSupportPrompt(previousTasks: TaskRecord[], nextTasks: TaskReco
   }
 }
 
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function normalizeAgentRound(value: unknown, fallbackIndex: number): AgentRound | null {
+  if (!value || typeof value !== 'object') return null
+  const round = value as Partial<AgentRound>
+  if (typeof round.id !== 'string' || !round.id) return null
+  if (typeof round.userMessageId !== 'string' || !round.userMessageId) return null
+
+  const status = round.status === 'running'
+    ? 'error'
+    : round.status === 'error' || round.status === 'done'
+    ? round.status
+    : 'done'
+
+  return {
+    id: round.id,
+    index: typeof round.index === 'number' ? round.index : fallbackIndex + 1,
+    parentRoundId: typeof round.parentRoundId === 'string' ? round.parentRoundId : null,
+    userMessageId: round.userMessageId,
+    ...(typeof round.assistantMessageId === 'string' ? { assistantMessageId: round.assistantMessageId } : {}),
+    prompt: typeof round.prompt === 'string' ? round.prompt : '',
+    inputImageIds: normalizeStringArray(round.inputImageIds),
+    outputTaskIds: normalizeStringArray(round.outputTaskIds),
+    ...(typeof round.responseId === 'string' ? { responseId: round.responseId } : {}),
+    ...(Array.isArray(round.responseOutput) ? { responseOutput: round.responseOutput } : {}),
+    status,
+    error: status === 'error'
+      ? typeof round.error === 'string' ? round.error : '上次请求已中断'
+      : null,
+    createdAt: typeof round.createdAt === 'number' ? round.createdAt : Date.now(),
+    finishedAt: typeof round.finishedAt === 'number' ? round.finishedAt : null,
+  }
+}
+
+function normalizeAgentMessage(value: unknown): AgentMessage | null {
+  if (!value || typeof value !== 'object') return null
+  const message = value as Partial<AgentMessage>
+  if (typeof message.id !== 'string' || !message.id) return null
+  if (message.role !== 'user' && message.role !== 'assistant') return null
+  if (typeof message.roundId !== 'string' || !message.roundId) return null
+
+  return {
+    id: message.id,
+    role: message.role,
+    content: typeof message.content === 'string' ? message.content : '',
+    roundId: message.roundId,
+    ...(Array.isArray(message.inputImageIds) ? { inputImageIds: normalizeStringArray(message.inputImageIds) } : {}),
+    ...(Array.isArray(message.outputTaskIds) ? { outputTaskIds: normalizeStringArray(message.outputTaskIds) } : {}),
+    createdAt: typeof message.createdAt === 'number' ? message.createdAt : Date.now(),
+  }
+}
+
 function normalizeAgentConversations(value: unknown): AgentConversation[] {
   if (!Array.isArray(value)) return []
 
   return value
     .filter((item): item is AgentConversation => Boolean(item) && typeof item === 'object' && typeof (item as AgentConversation).id === 'string')
-    .map((conversation) => ({
-      id: conversation.id,
-      title: typeof conversation.title === 'string' && conversation.title.trim() ? conversation.title : '新对话',
-      createdAt: typeof conversation.createdAt === 'number' ? conversation.createdAt : Date.now(),
-      updatedAt: typeof conversation.updatedAt === 'number' ? conversation.updatedAt : Date.now(),
-      rounds: Array.isArray(conversation.rounds) ? conversation.rounds : [],
-      messages: Array.isArray(conversation.messages) ? conversation.messages : [],
-    }))
+    .map((conversation) => {
+      const normalizedRounds = Array.isArray(conversation.rounds)
+        ? conversation.rounds.map(normalizeAgentRound).filter((round): round is AgentRound => Boolean(round))
+        : []
+      const hasBranchParents = normalizedRounds.some((round) => round.parentRoundId)
+      const hasStoredActiveRound = typeof conversation.activeRoundId === 'string'
+      const rounds = hasBranchParents || hasStoredActiveRound
+        ? normalizedRounds
+        : normalizedRounds.map((round, index) => ({
+            ...round,
+            parentRoundId: index > 0 ? normalizedRounds[index - 1].id : null,
+          }))
+      const roundIds = new Set(rounds.map((round) => round.id))
+      const messages = Array.isArray(conversation.messages)
+        ? conversation.messages
+            .map(normalizeAgentMessage)
+            .filter((message): message is AgentMessage => message != null && roundIds.has(message.roundId))
+        : []
+      return {
+        id: conversation.id,
+        title: typeof conversation.title === 'string' && conversation.title.trim() ? conversation.title : '新对话',
+        activeRoundId: typeof conversation.activeRoundId === 'string' && roundIds.has(conversation.activeRoundId) ? conversation.activeRoundId : rounds[rounds.length - 1]?.id ?? null,
+        createdAt: typeof conversation.createdAt === 'number' ? conversation.createdAt : Date.now(),
+        updatedAt: typeof conversation.updatedAt === 'number' ? conversation.updatedAt : Date.now(),
+        rounds,
+        messages,
+      }
+    })
 }
 
 function createAgentConversation(now = Date.now()): AgentConversation {
   return {
     id: genId(),
     title: '新对话',
+    activeRoundId: null,
     createdAt: now,
     updatedAt: now,
     rounds: [],
     messages: [],
   }
+}
+
+function createAgentConversationTitle(prompt: string, fallbackTitle: string) {
+  const title = prompt.replace(/\s+/g, ' ').trim()
+  if (!title) return fallbackTitle
+  const chars = Array.from(title)
+  if (chars.length <= AGENT_CONVERSATION_TITLE_MAX_LENGTH) return title
+  return `${chars.slice(0, AGENT_CONVERSATION_TITLE_MAX_LENGTH - 3).join('')}...`
+}
+
+function isEmptyAgentConversation(conversation: AgentConversation) {
+  return conversation.rounds.length === 0 && conversation.messages.length === 0 && !conversation.activeRoundId
+}
+
+function getLatestAgentConversation(conversations: AgentConversation[]) {
+  return conversations.reduce<AgentConversation | null>((latest, conversation) => {
+    if (!latest) return conversation
+    if (conversation.updatedAt !== latest.updatedAt) return conversation.updatedAt > latest.updatedAt ? conversation : latest
+    return conversation.createdAt > latest.createdAt ? conversation : latest
+  }, null)
 }
 
 export function getPersistedState(state: AppState) {
@@ -431,13 +562,18 @@ interface AppState {
   agentSidebarCollapsed: boolean
   agentAssetTab: 'references' | 'outputs'
   agentAssetPanelCollapsed: boolean
+  agentMobileHeaderVisible: boolean
+  agentEditingRoundId: string | null
   createAgentConversation: () => string
   setActiveAgentConversationId: (id: string | null) => void
+  setActiveAgentRoundId: (conversationId: string, roundId: string | null) => void
   renameAgentConversation: (id: string, title: string) => void
   deleteAgentConversation: (id: string) => void
   setAgentSidebarCollapsed: (collapsed: boolean) => void
   setAgentAssetTab: (tab: 'references' | 'outputs') => void
   setAgentAssetPanelCollapsed: (collapsed: boolean) => void
+  setAgentMobileHeaderVisible: (visible: boolean) => void
+  setAgentEditingRoundId: (id: string | null) => void
 
   // 任务列表
   tasks: TaskRecord[]
@@ -464,7 +600,8 @@ interface AppState {
   lightboxImageList: string[]
   setLightboxImageId: (id: string | null, list?: string[]) => void
   showSettings: boolean
-  setShowSettings: (v: boolean) => void
+  settingsTabRequest: SettingsTab | null
+  setShowSettings: (v: boolean, tab?: SettingsTab) => void
   supportPromptOpen: boolean
   supportPromptDismissed: boolean
   supportPromptSkippedForImportedData: boolean
@@ -472,8 +609,8 @@ interface AppState {
   dismissSupportPrompt: () => void
 
   // Toast
-  toast: { message: string; type: 'info' | 'success' | 'error' } | null
-  showToast: (message: string, type?: 'info' | 'success' | 'error') => void
+  toast: { message: string; type: ToastType } | null
+  showToast: (message: string, type?: ToastType) => void
 
   // Confirm dialog
   confirmDialog: {
@@ -499,7 +636,7 @@ export const useStore = create<AppState>()(
       appMode: 'gallery',
       setAppMode: (appMode) => {
         if (appMode === 'gallery') {
-          set({ appMode })
+          set({ appMode, agentMobileHeaderVisible: true, selectedTaskIds: [], agentEditingRoundId: null })
           return
         }
 
@@ -508,41 +645,30 @@ export const useStore = create<AppState>()(
         const activeProfile = getActiveApiProfile(settings)
 
         if (activeProfile.provider === 'openai' && activeProfile.apiMode === 'responses') {
-          set({ appMode: 'agent' })
+          set({ appMode: 'agent', agentMobileHeaderVisible: false, agentSidebarCollapsed: true, agentAssetPanelCollapsed: true, selectedTaskIds: [] })
           return
         }
 
-        if (activeProfile.provider === 'openai') {
+        if (activeProfile.provider === 'openai' && activeProfile.apiMode !== 'responses') {
           state.setConfirmDialog({
-            title: 'Agent 模式需要 Responses API',
-            message: `当前 API 配置「${activeProfile.name}」不是 Responses API。是否将该配置切换为 Responses API 后进入 Agent 模式？`,
-            confirmText: '切换并进入',
+            title: '需要 Responses API 配置',
+            message: `当前配置「${activeProfile.name}」使用的是 Images API，仅支持生成图片，无 Agent 模式需要的对话能力。\n\n请前往 API 配置页，将当前配置调整为 Responses API，或切换/新建一个支持 Responses API 的配置。`,
+            confirmText: '去设置',
             cancelText: '取消',
             action: () => {
-              const latestSettings = normalizeSettings(useStore.getState().settings)
-              const nextProfiles = latestSettings.profiles.map((profile) =>
-                profile.id === latestSettings.activeProfileId
-                  ? {
-                      ...profile,
-                      apiMode: 'responses' as const,
-                      model: profile.model === DEFAULT_IMAGES_MODEL ? DEFAULT_RESPONSES_MODEL : profile.model,
-                    }
-                  : profile,
-              )
-              useStore.getState().setSettings({ profiles: nextProfiles })
-              useStore.setState({ appMode: 'agent' })
+              useStore.getState().setShowSettings(true, 'api')
             },
           })
           return
         }
 
         state.setConfirmDialog({
-          title: 'Agent 模式需要 Responses API',
-          message: `当前服务商「${activeProfile.name}」不能用于 Agent 模式。请在设置中添加或切换到 OpenAI Responses API 配置。`,
-          confirmText: '打开设置',
+          title: '配置不支持 Agent 模式',
+          message: `当前配置「${activeProfile.name}」所属的服务商暂不支持 Agent 模式。Agent 模式需要使用支持 Responses API 的 OpenAI 配置。\n\n请前往 API 配置页，切换或新建一个支持 Responses API 的配置。`,
+          confirmText: '去设置',
           cancelText: '取消',
           action: () => {
-            useStore.getState().setShowSettings(true)
+            useStore.getState().setShowSettings(true, 'api')
           },
         })
       },
@@ -683,35 +809,53 @@ export const useStore = create<AppState>()(
       // Agent
       agentConversations: [],
       activeAgentConversationId: null,
-      agentSidebarCollapsed: false,
-      agentAssetTab: 'outputs',
-      agentAssetPanelCollapsed: false,
+      agentSidebarCollapsed: true,
+      agentAssetTab: 'references',
+      agentAssetPanelCollapsed: true,
+      agentMobileHeaderVisible: true,
+      agentEditingRoundId: null,
       createAgentConversation: () => {
-        const conversation = createAgentConversation()
-        set((s) => ({
-          agentConversations: [conversation, ...s.agentConversations],
+        const now = Date.now()
+        const latestConversation = getLatestAgentConversation(get().agentConversations)
+        if (latestConversation && isEmptyAgentConversation(latestConversation)) {
+          set((state) => ({
+            agentConversations: state.agentConversations.map((conversation) =>
+              conversation.id === latestConversation.id
+                ? { ...conversation, createdAt: now, updatedAt: now }
+                : conversation,
+            ),
+            activeAgentConversationId: latestConversation.id,
+            agentSidebarCollapsed: true,
+            agentEditingRoundId: null,
+          }))
+          return latestConversation.id
+        }
+
+        const conversation = createAgentConversation(now)
+        set((state) => ({
+          agentConversations: [
+            ...state.agentConversations,
+            conversation,
+          ],
           activeAgentConversationId: conversation.id,
+          agentSidebarCollapsed: true,
+          agentEditingRoundId: null,
         }))
         return conversation.id
       },
-      setActiveAgentConversationId: (activeAgentConversationId) => set({ activeAgentConversationId }),
-      renameAgentConversation: (id, title) => set((s) => ({
-        agentConversations: s.agentConversations.map((conversation) =>
-          conversation.id === id
-            ? { ...conversation, title: title.trim() || '新对话', updatedAt: Date.now() }
-            : conversation,
+      setActiveAgentConversationId: (id) => set({ activeAgentConversationId: id, agentSidebarCollapsed: true, agentAssetPanelCollapsed: true, agentEditingRoundId: null }),
+      setActiveAgentRoundId: (conversationId, roundId) => set((state) => ({
+        agentConversations: state.agentConversations.map((conversation) =>
+          conversation.id === conversationId ? { ...conversation, activeRoundId: roundId, updatedAt: Date.now() } : conversation,
         ),
       })),
-      deleteAgentConversation: (id) => set((s) => {
-        const agentConversations = s.agentConversations.filter((conversation) => conversation.id !== id)
-        return {
-          agentConversations,
-          activeAgentConversationId: s.activeAgentConversationId === id ? agentConversations[0]?.id ?? null : s.activeAgentConversationId,
-        }
-      }),
+      renameAgentConversation: (id, title) => set((state) => ({ agentConversations: state.agentConversations.map((c) => (c.id === id ? { ...c, title, updatedAt: Date.now() } : c)) })),
+      deleteAgentConversation: (id) => set((state) => ({ agentConversations: state.agentConversations.filter((c) => c.id !== id), activeAgentConversationId: state.activeAgentConversationId === id ? null : state.activeAgentConversationId })),
       setAgentSidebarCollapsed: (agentSidebarCollapsed) => set({ agentSidebarCollapsed }),
       setAgentAssetTab: (agentAssetTab) => set({ agentAssetTab }),
       setAgentAssetPanelCollapsed: (agentAssetPanelCollapsed) => set({ agentAssetPanelCollapsed }),
+      setAgentMobileHeaderVisible: (agentMobileHeaderVisible) => set({ agentMobileHeaderVisible }),
+      setAgentEditingRoundId: (agentEditingRoundId) => set({ agentEditingRoundId }),
 
       // Tasks
       tasks: [],
@@ -760,9 +904,14 @@ export const useStore = create<AppState>()(
         set({ lightboxImageId, lightboxImageList: list ?? (lightboxImageId ? [lightboxImageId] : []) })
       },
       showSettings: false,
-      setShowSettings: (showSettings) => {
+      settingsTabRequest: null,
+      setShowSettings: (showSettings, settingsTabRequest) => {
         if (showSettings) dismissAllTooltips()
-        set({ showSettings })
+        set({
+          showSettings,
+          ...(settingsTabRequest ? { settingsTabRequest } : {}),
+          ...(!showSettings ? { settingsTabRequest: null } : {}),
+        })
       },
       supportPromptOpen: false,
       supportPromptDismissed: false,
@@ -773,9 +922,11 @@ export const useStore = create<AppState>()(
       // Toast
       toast: null,
       showToast: (message, type = 'info') => {
-        set({ toast: { message, type } })
+        const toastMessage = getToastMessage(message, type)
+        const toast = { message: toastMessage, type }
+        set({ toast })
         setTimeout(() => {
-          set((s) => (s.toast?.message === message ? { toast: null } : s))
+          set((s) => (s.toast === toast ? { toast: null } : s))
         }, 3000)
       },
 
@@ -991,18 +1142,16 @@ function isApiRequestNetworkError(err: unknown): boolean {
   return false
 }
 
-function getApiRequestNetworkErrorHint(err: unknown, task: TaskRecord, settings: AppSettings): string | null {
+function getApiRequestNetworkErrorHint(err: unknown, createdAt: number, usesApiProxy: boolean): string | null {
   if (!isApiRequestNetworkError(err)) return null
 
-  const profile = getTaskApiProfile(settings, task)
-  const elapsedSeconds = Math.max(0, (Date.now() - task.createdAt) / 1000)
-  const usesApiProxy = profile?.apiProxy ?? settings.apiProxy
+  const elapsedSeconds = Math.max(0, (Date.now() - createdAt) / 1000)
 
   if (elapsedSeconds <= 15) {
     if (usesApiProxy) {
       return '提示：请求立即失败，请检查 API 代理服务是否正常运行。'
     }
-    return '提示：接口可能不支持浏览器跨域请求，可开启 API 代理解决。'
+    return '提示：请求立即失败，可能原因：\n· API 服务器不可达或地址有误，请检查 API URL 是否正确、服务是否正常运行\n· 接口不支持浏览器跨域请求，可使用 Docker 部署版或本地运行版并配置 API 代理解决'
   }
 
   if (elapsedSeconds >= 55 && elapsedSeconds <= 75) {
@@ -1355,6 +1504,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   const latestTasks = useStore.getState().tasks
   useStore.getState().setTasks([task, ...latestTasks])
   await putTask(task)
+  useStore.getState().showToast('任务已提交', 'success')
 
   if (settings.clearInputAfterSubmit) {
     useStore.getState().setPrompt('')
@@ -1383,28 +1533,119 @@ function updateAgentConversation(conversationId: string, updater: (conversation:
   }))
 }
 
-function collectAgentRoundOutputImages(round: AgentRound, tasks: TaskRecord[]) {
-  const images: string[] = []
-  for (const taskId of round.outputTaskIds) {
-    const task = tasks.find((item) => item.id === taskId)
-    if (task) images.push(...task.outputImages)
-  }
-  return images
+function getAgentRoundControllerKey(conversationId: string, roundId: string) {
+  return `${conversationId}:${roundId}`
 }
 
-function resolveAgentPromptImageReferences(prompt: string, conversation: AgentConversation, tasks: TaskRecord[]) {
-  const refs: string[] = []
-  const re = /@(?:第)?(\d+)轮图(\d+)/g
-  for (const match of prompt.matchAll(re)) {
-    const roundIndex = Number(match[1]) - 1
-    const imageIndex = Number(match[2]) - 1
-    const round = conversation.rounds[roundIndex]
-    if (!round || imageIndex < 0) continue
-    const images = collectAgentRoundOutputImages(round, tasks)
-    const imageId = images[imageIndex]
-    if (imageId) refs.push(imageId)
+function createAgentAbortError() {
+  return new DOMException('Agent 请求已停止', 'AbortError')
+}
+
+function markAgentRoundStopped(conversationId: string, roundId: string) {
+  updateAgentConversation(conversationId, (current) => {
+    const round = current.rounds.find((item) => item.id === roundId)
+    if (!round || round.status !== 'running') return current
+
+    const existingAssistantMessage = current.messages.find((message) => message.roundId === roundId && message.role === 'assistant')
+    const assistantMessageId = existingAssistantMessage?.id ?? genId()
+    return {
+      ...current,
+      updatedAt: Date.now(),
+      rounds: current.rounds.map((item) =>
+        item.id === roundId
+          ? {
+              ...item,
+              ...(assistantMessageId ? { assistantMessageId } : {}),
+              status: 'error',
+              error: AGENT_STOPPED_MESSAGE,
+              finishedAt: Date.now(),
+            }
+          : item,
+      ),
+      messages: existingAssistantMessage
+        ? current.messages
+        : [
+            ...current.messages,
+            {
+              id: assistantMessageId,
+              role: 'assistant',
+              content: AGENT_STOPPED_MESSAGE,
+              roundId,
+              createdAt: Date.now(),
+            },
+          ],
+    }
+  })
+}
+
+export function stopAgentResponse(conversationId = useStore.getState().activeAgentConversationId) {
+  if (!conversationId) return
+  const conversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
+  if (!conversation) return
+  const activeRunningRound = [...getActiveAgentRounds(conversation)].reverse().find((round) => round.status === 'running')
+  const runningRound = activeRunningRound ?? conversation.rounds.find((round) => round.status === 'running')
+  if (!runningRound) return
+
+  const controller = agentRoundControllers.get(getAgentRoundControllerKey(conversationId, runningRound.id))
+  if (controller) {
+    controller.abort()
+    return
   }
-  return refs
+
+  markAgentRoundStopped(conversationId, runningRound.id)
+  useStore.getState().showToast('已停止 Agent 回复', 'info')
+}
+
+function getAgentRoundChildren(conversation: AgentConversation, parentRoundId: string | null) {
+  return conversation.rounds.filter((round) => (round.parentRoundId ?? null) === parentRoundId)
+}
+
+function getLatestAgentLeafId(conversation: AgentConversation, startRoundId: string | null = null): string | null {
+  let currentId = startRoundId
+  if (!currentId) {
+    const roots = getAgentRoundChildren(conversation, null)
+    currentId = roots[roots.length - 1]?.id ?? null
+  }
+
+  while (currentId) {
+    const children = getAgentRoundChildren(conversation, currentId)
+    const nextId = children[children.length - 1]?.id ?? null
+    if (!nextId) return currentId
+    currentId = nextId
+  }
+
+  return null
+}
+
+export function getAgentRoundPath(conversation: AgentConversation, roundId: string | null): AgentRound[] {
+  if (!roundId) return []
+  const byId = new Map(conversation.rounds.map((round) => [round.id, round]))
+  const path: AgentRound[] = []
+  const seen = new Set<string>()
+  let current = byId.get(roundId) ?? null
+
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id)
+    path.unshift(current)
+    current = current.parentRoundId ? byId.get(current.parentRoundId) ?? null : null
+  }
+
+  return path
+}
+
+export function getActiveAgentRounds(conversation: AgentConversation): AgentRound[] {
+  const activeRoundId = conversation.activeRoundId && conversation.rounds.some((round) => round.id === conversation.activeRoundId)
+    ? conversation.activeRoundId
+    : getLatestAgentLeafId(conversation)
+  return getAgentRoundPath(conversation, activeRoundId ?? null)
+}
+
+export function getAgentSiblingRounds(conversation: AgentConversation, round: AgentRound) {
+  return getAgentRoundChildren(conversation, round.parentRoundId ?? null)
+}
+
+export function getAgentBranchLeafId(conversation: AgentConversation, roundId: string) {
+  return getLatestAgentLeafId(conversation, roundId) ?? roundId
 }
 
 function uniqueIds(ids: string[]) {
@@ -1428,36 +1669,122 @@ async function readAgentImageDataUrls(ids: string[]) {
   return dataUrls
 }
 
-async function buildAgentApiMessages(conversation: AgentConversation, tasks: TaskRecord[]): Promise<AgentApiMessage[]> {
-  const roundsById = new Map(conversation.rounds.map((round) => [round.id, round]))
-  const messages: AgentApiMessage[] = []
+async function createAgentUserInputItem(conversation: AgentConversation, round: AgentRound, message: AgentMessage, tasks: TaskRecord[]) {
+  const imageDataUrls = await readAgentImageDataUrls(round.inputImageIds)
+  const rounds = getAgentRoundPath(conversation, round.id)
+  const text = replaceAgentPromptImageReferencesForApi(message.content, round, rounds, tasks)
+  const referenceText = round.inputImageIds.length > 0
+    ? `\n\n<available_refs>${round.inputImageIds.map((_, index) => `\n  <ref id="${getAgentCurrentReferenceId(round, index)}" />`).join('')}\n</available_refs>`
+    : ''
+  return {
+    role: 'user',
+    content: [
+      { type: 'input_text', text: `${text}${referenceText}` },
+      ...imageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl })),
+    ],
+  }
+}
 
-  for (const message of conversation.messages) {
-    const round = roundsById.get(message.roundId)
-    if (message.role === 'user') {
-      messages.push({
-        role: 'user',
-        text: message.content,
-        imageDataUrls: round ? await readAgentImageDataUrls(round.inputImageIds) : [],
+function createAgentGeneratedReferenceLabelsItem(round: AgentRound, tasks: TaskRecord[]) {
+  const count = collectAgentRoundOutputImages(round, tasks).length
+  if (count <= 0) return null
+  const refs = Array.from({ length: count }, (_, index) => `\n  <ref id="${getAgentGeneratedImageReferenceId(round, index)}" />`).join('')
+  return createAgentAssistantFallbackItem(
+    `<available_refs>${refs}\n</available_refs>`,
+  )
+}
+
+function createAgentAssistantFallbackItem(text: string) {
+  return {
+    role: 'assistant',
+    content: [{ type: 'output_text', text }],
+  }
+}
+
+function parseResponseOutputFromPayload(rawResponsePayload?: string): ResponsesOutputItem[] | null {
+  if (!rawResponsePayload) return null
+  try {
+    const payload = JSON.parse(rawResponsePayload) as { output?: unknown }
+    return Array.isArray(payload.output) ? payload.output as ResponsesOutputItem[] : null
+  } catch {
+    return null
+  }
+}
+
+function sanitizeResponseOutputItemForInput(item: ResponsesOutputItem): unknown | null {
+  if (item.type === 'image_generation_call') {
+    if (typeof item.result !== 'string' || !item.result.trim()) return null
+    return {
+      ...(typeof item.id === 'string' && item.id ? { id: item.id } : {}),
+      type: 'image_generation_call',
+      result: item.result,
+    }
+  }
+
+  if (item.type === 'message') {
+    const content = (item.content ?? [])
+      .map((part) => {
+        if (typeof part.text !== 'string') return null
+        if (part.type === 'output_text' || part.type === 'text') {
+          return { type: 'output_text', text: part.text }
+        }
+        return null
       })
+      .filter((part): part is { type: 'output_text'; text: string } => Boolean(part))
+
+    return content.length > 0 ? { role: 'assistant', content } : null
+  }
+
+  return item
+}
+
+function sanitizeResponseOutputForInput(output: ResponsesOutputItem[]) {
+  return output
+    .map(sanitizeResponseOutputItemForInput)
+    .filter((item): item is unknown => item != null)
+}
+
+function getAgentRoundResponseOutput(round: AgentRound, tasks: TaskRecord[]): ResponsesOutputItem[] | null {
+  if (round.responseOutput?.length) return round.responseOutput
+
+  for (const taskId of round.outputTaskIds) {
+    const task = tasks.find((item) => item.id === taskId)
+    const output = parseResponseOutputFromPayload(task?.rawResponsePayload)
+    if (output?.length) return output
+  }
+
+  return null
+}
+
+async function buildAgentApiInput(conversation: AgentConversation, currentRound: AgentRound, tasks: TaskRecord[]): Promise<unknown[]> {
+  const input: unknown[] = []
+  const rounds = getAgentRoundPath(conversation, currentRound.id)
+
+  for (const round of rounds) {
+    const userMessage = conversation.messages.find((message) => message.id === round.userMessageId)
+    if (!userMessage) continue
+
+    input.push(await createAgentUserInputItem(conversation, round, userMessage, tasks))
+    if (round.id === currentRound.id) continue
+
+    const output = getAgentRoundResponseOutput(round, tasks)
+    if (output?.length) {
+      input.push(...sanitizeResponseOutputForInput(output))
+      const labelsItem = createAgentGeneratedReferenceLabelsItem(round, tasks)
+      if (labelsItem) input.push(labelsItem)
       continue
     }
 
-    const outputImages = round ? collectAgentRoundOutputImages(round, tasks) : []
-    const removedOutputTaskCount = round ? round.outputTaskIds.filter((taskId) => !tasks.some((task) => task.id === taskId)).length : 0
-    const imageSummary = outputImages.length > 0
-      ? `\n[Generated images in this turn: ${outputImages.map((_, index) => `round ${round?.index ?? '?'} image ${index + 1}`).join(', ')}]`
-      : removedOutputTaskCount > 0
-      ? '\n[Generated image removed]'
-      : ''
-
-    messages.push({
-      role: 'assistant',
-      text: `${message.content || ''}${imageSummary}`.trim() || '[No text response]',
-    })
+    const assistantMessage = round.assistantMessageId
+      ? conversation.messages.find((message) => message.id === round.assistantMessageId)
+      : null
+    const removedOutputTaskCount = round.outputTaskIds.filter((taskId) => !tasks.some((task) => task.id === taskId)).length
+    input.push(createAgentAssistantFallbackItem(
+      assistantMessage?.content || (removedOutputTaskCount > 0 ? '[Generated image removed]' : '[No text response]'),
+    ))
   }
 
-  return messages
+  return input
 }
 
 export async function submitAgentMessage() {
@@ -1484,21 +1811,43 @@ export async function submitAgentMessage() {
   }
 
   const conversation = getActiveAgentConversation()
-  const referencedIds = resolveAgentPromptImageReferences(trimmedPrompt, conversation, state.tasks)
-  const inputImageIds = uniqueIds([...inputImages.map((image) => image.id), ...referencedIds])
+  if (conversation.rounds.some((round) => round.status === 'running')) {
+    showToast('请等待 Agent 回复完成，或先停止生成', 'info')
+    return
+  }
+
+  const inputImageIds = uniqueIds(inputImages.map((image) => image.id))
 
   for (const image of inputImages) {
     await storeImage(image.dataUrl)
   }
 
   const requestSettings = createSettingsForApiProfile(normalizedSettings, activeProfile)
-  const normalizedParams = normalizeParamsForSettings(params, requestSettings, { hasInputImages: inputImageIds.length > 0 })
+  const normalizedParams = {
+    ...normalizeParamsForSettings(params, requestSettings, { hasInputImages: inputImageIds.length > 0 }),
+    n: DEFAULT_PARAMS.n,
+  }
   const now = Date.now()
-  const roundId = genId()
-  const userMessageId = genId()
+  const editingRound = state.agentEditingRoundId
+    ? conversation.rounds.find((item) => item.id === state.agentEditingRoundId) ?? null
+    : null
+  const editingRoundHasAssistantMessage = editingRound?.assistantMessageId
+    ? conversation.messages.some((message) => message.id === editingRound.assistantMessageId)
+    : conversation.messages.some((message) => message.roundId === editingRound?.id && message.role === 'assistant')
+  const editingRoundHasChildren = editingRound
+    ? conversation.rounds.some((round) => (round.parentRoundId ?? null) === editingRound.id)
+    : false
+  const shouldAppendToEditingRound = Boolean(editingRound && !editingRoundHasAssistantMessage && !editingRoundHasChildren)
+  const roundId = shouldAppendToEditingRound && editingRound ? editingRound.id : genId()
+  const userMessageId = shouldAppendToEditingRound && editingRound ? editingRound.userMessageId : genId()
+  const activeRounds = getActiveAgentRounds(conversation)
+  const activeLeafId = activeRounds[activeRounds.length - 1]?.id ?? null
+  const parentRoundId = editingRound ? editingRound.parentRoundId ?? null : activeLeafId
+  const parentPath = parentRoundId ? getAgentRoundPath(conversation, parentRoundId) : []
   const round: AgentRound = {
     id: roundId,
-    index: conversation.rounds.length + 1,
+    index: shouldAppendToEditingRound && editingRound ? editingRound.index : parentPath.length + 1,
+    parentRoundId,
     userMessageId,
     prompt: trimmedPrompt,
     inputImageIds,
@@ -1519,15 +1868,23 @@ export async function submitAgentMessage() {
 
   updateAgentConversation(conversation.id, (current) => ({
     ...current,
-    title: current.rounds.length === 0 ? trimmedPrompt.slice(0, 40) || current.title : current.title,
+    title: current.rounds.length === 0 ? createAgentConversationTitle(trimmedPrompt, current.title) : current.title,
+    activeRoundId: roundId,
     updatedAt: now,
-    rounds: [...current.rounds, round],
-    messages: [...current.messages, userMessage],
+    rounds: shouldAppendToEditingRound
+      ? current.rounds.map((item) => item.id === roundId ? round : item)
+      : [...current.rounds, round],
+    messages: shouldAppendToEditingRound
+      ? current.messages.some((message) => message.id === userMessageId)
+        ? current.messages.map((message) => message.id === userMessageId ? userMessage : message)
+        : [...current.messages, userMessage]
+      : [...current.messages, userMessage],
   }))
 
   state.setPrompt('')
   state.clearInputImages()
   state.clearMaskDraft()
+  state.setAgentEditingRoundId(null)
 
   void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile)
 }
@@ -1540,71 +1897,87 @@ async function executeAgentRound(
   activeProfile: ApiProfile,
 ) {
   const startedAt = Date.now()
+  const controller = new AbortController()
+  const controllerKey = getAgentRoundControllerKey(conversationId, roundId)
+  agentRoundControllers.set(controllerKey, controller)
   try {
     const latestState = useStore.getState()
     const conversation = latestState.agentConversations.find((item) => item.id === conversationId)
     if (!conversation) return
+    const round = conversation.rounds.find((item) => item.id === roundId)
+    const userMessage = round ? conversation.messages.find((message) => message.id === round.userMessageId) : null
+    if (!round || !userMessage) return
 
-    const apiMessages = await buildAgentApiMessages(conversation, latestState.tasks)
+    const apiInput = await buildAgentApiInput(conversation, round, latestState.tasks)
+    if (controller.signal.aborted) throw createAgentAbortError()
     const result = await callAgentResponsesApi({
       settings: requestSettings,
       profile: activeProfile,
       params,
-      messages: apiMessages,
+      input: apiInput,
+      signal: controller.signal,
     })
-
     const assistantMessageId = genId()
-    const outputIds: string[] = []
+    const outputs: Array<{ imageId: string; image: (typeof result.images)[number] }> = []
     for (const image of result.images) {
       const imgId = await storeImage(image.dataUrl, 'generated')
       cacheImage(imgId, image.dataUrl)
-      outputIds.push(imgId)
+      outputs.push({ imageId: imgId, image })
     }
+    const outputIds = outputs.map((output) => output.imageId)
 
     const taskIds: string[] = []
-    if (outputIds.length > 0) {
-      const taskId = genId()
-      const round = conversation.rounds.find((item) => item.id === roundId)
-      const revisedPromptByImage = result.images.reduce<Record<string, string>>((acc, image, index) => {
-        const imageId = outputIds[index]
-        if (imageId && image.revisedPrompt) acc[imageId] = image.revisedPrompt
-        return acc
-      }, {})
-      const task: TaskRecord = {
-        id: taskId,
-        prompt: round?.prompt ?? apiMessages[apiMessages.length - 1]?.text ?? '',
-        params,
-        apiProvider: activeProfile.provider,
-        apiProfileId: activeProfile.id,
-        apiProfileName: activeProfile.name,
-        apiModel: activeProfile.model,
-        inputImageIds: round?.inputImageIds ?? [],
-        maskTargetImageId: null,
-        maskImageId: null,
-        outputImages: outputIds,
-        actualParams: { n: outputIds.length },
-        revisedPromptByImage: Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
-        rawResponsePayload: result.rawResponsePayload,
-        status: 'done',
-        error: null,
-        createdAt: startedAt,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - startedAt,
-        sourceMode: 'agent',
-        agentConversationId: conversationId,
-        agentRoundId: roundId,
-        agentMessageId: assistantMessageId,
+    if (outputs.length > 0) {
+      const createdTasks: TaskRecord[] = []
+
+      for (const output of outputs) {
+        const actualParams: Partial<TaskParams> = {
+          ...(Object.keys(output.image.actualParams ?? {}).length ? output.image.actualParams : {}),
+          n: 1,
+        }
+        const task: TaskRecord = {
+          id: genId(),
+          prompt: output.image.revisedPrompt ?? round?.prompt ?? userMessage.content,
+          params,
+          apiProvider: activeProfile.provider,
+          apiProfileId: activeProfile.id,
+          apiProfileName: activeProfile.name,
+          apiModel: activeProfile.model,
+          inputImageIds: round?.inputImageIds ?? [],
+          maskTargetImageId: null,
+          maskImageId: null,
+          outputImages: [output.imageId],
+          actualParams,
+          actualParamsByImage: { [output.imageId]: actualParams },
+          revisedPromptByImage: output.image.revisedPrompt ? { [output.imageId]: output.image.revisedPrompt } : undefined,
+          rawResponsePayload: result.rawResponsePayload,
+          status: 'done',
+          error: null,
+          createdAt: startedAt,
+          finishedAt: Date.now(),
+          elapsed: Date.now() - startedAt,
+          sourceMode: 'agent',
+          agentConversationId: conversationId,
+          agentRoundId: roundId,
+          agentMessageId: assistantMessageId,
+          agentToolCallId: output.image.toolCallId,
+          agentToolAction: output.image.action,
+        }
+        createdTasks.push(task)
+        taskIds.push(task.id)
       }
+
       const latestTasks = useStore.getState().tasks
-      useStore.getState().setTasks([task, ...latestTasks])
-      await putTask(task)
-      taskIds.push(taskId)
+      useStore.getState().setTasks([...createdTasks, ...latestTasks])
+      for (const task of createdTasks) {
+        await putTask(task)
+      }
     }
 
     const assistantMessage: AgentMessage = {
       id: assistantMessageId,
       role: 'assistant',
-      content: result.text || (outputIds.length > 0 ? 'Generated image.' : ''),
+      content: result.text.trim() || (outputIds.length > 0 ? 'Generated image.' : ''),
       roundId,
       outputTaskIds: taskIds,
       createdAt: Date.now(),
@@ -1619,6 +1992,8 @@ async function executeAgentRound(
               ...round,
               assistantMessageId,
               outputTaskIds: taskIds,
+              responseId: result.responseId,
+              responseOutput: outputs.length > 0 ? undefined : result.outputItems,
               status: 'done',
               error: null,
               finishedAt: Date.now(),
@@ -1628,11 +2003,24 @@ async function executeAgentRound(
       messages: [...current.messages, assistantMessage],
     }))
 
-    useStore.getState().showToast(outputIds.length > 0 ? `Agent 已生成 ${outputIds.length} 张图片` : 'Agent 已回复', 'success')
+    useStore.getState().showToast(outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
+    if (controller.signal.aborted) {
+      markAgentRoundStopped(conversationId, roundId)
+      useStore.getState().showToast('已停止 Agent 回复', 'info')
+      return
+    }
+
+    let message = err instanceof Error ? err.message : String(err)
+    const usesApiProxy = activeProfile.apiProxy ?? requestSettings.apiProxy
+    const networkErrorHint = getApiRequestNetworkErrorHint(err, startedAt, usesApiProxy)
+    if (networkErrorHint && !message.includes(IMAGE_FETCH_CORS_HINT)) {
+      message += `\n${networkErrorHint}`
+    }
+
     updateAgentConversation(conversationId, (current) => ({
       ...current,
+      title: current.rounds.length === 1 && current.rounds[0].id === roundId ? '新对话' : current.title,
       updatedAt: Date.now(),
       rounds: current.rounds.map((round) =>
         round.id === roundId
@@ -1651,6 +2039,10 @@ async function executeAgentRound(
       ],
     }))
     useStore.getState().showToast(`Agent 请求失败：${message}`, 'error')
+  } finally {
+    if (agentRoundControllers.get(controllerKey) === controller) {
+      agentRoundControllers.delete(controllerKey)
+    }
   }
 }
 
@@ -1819,7 +2211,10 @@ async function executeTask(taskId: string) {
       scheduleCustomRecovery(taskId)
     } else {
       let errorMessage = err instanceof Error ? err.message : String(err)
-      const networkErrorHint = getApiRequestNetworkErrorHint(err, latestTask, useStore.getState().settings)
+      const settings = useStore.getState().settings
+      const profile = getTaskApiProfile(settings, latestTask)
+      const usesApiProxy = profile?.apiProxy ?? settings.apiProxy
+      const networkErrorHint = getApiRequestNetworkErrorHint(err, latestTask.createdAt, usesApiProxy)
       if (networkErrorHint && !errorMessage.includes(IMAGE_FETCH_CORS_HINT)) {
         errorMessage += `\n${networkErrorHint}`
       }

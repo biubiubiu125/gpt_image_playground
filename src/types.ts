@@ -181,6 +181,10 @@ export interface TaskRecord {
   agentRoundId?: string
   /** Agent 消息 ID */
   agentMessageId?: string
+  /** Agent 图像工具调用 ID */
+  agentToolCallId?: string
+  /** Agent 图像工具实际动作 */
+  agentToolAction?: 'generate' | 'edit' | 'auto' | string
 }
 
 // ===== Agent 模式 =====
@@ -201,11 +205,14 @@ export interface AgentMessage {
 export interface AgentRound {
   id: string
   index: number
+  parentRoundId?: string | null
   userMessageId: string
   assistantMessageId?: string
   prompt: string
   inputImageIds: string[]
   outputTaskIds: string[]
+  responseId?: string
+  responseOutput?: ResponsesOutputItem[]
   status: AgentRoundStatus
   error: string | null
   createdAt: number
@@ -215,6 +222,7 @@ export interface AgentRound {
 export interface AgentConversation {
   id: string
   title: string
+  activeRoundId?: string | null
   createdAt: number
   updatedAt: number
   rounds: AgentRound[]
@@ -288,6 +296,7 @@ export interface ResponsesOutputItem {
   id?: string
   type?: string
   status?: string
+  action?: string
   content?: Array<{
     type?: string
     text?: string

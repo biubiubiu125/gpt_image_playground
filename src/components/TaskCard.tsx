@@ -1,10 +1,11 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, type ReactNode } from 'react'
 import type { TaskRecord } from '../types'
 import { useStore, ensureImageThumbnailCached, subscribeImageThumbnail, updateTaskInStore, retryTask } from '../store'
 import { formatImageRatio } from '../lib/size'
 import { getParamDisplay, ActualValueBadge } from '../lib/paramDisplay'
 import { DEFAULT_IMAGES_MODEL, DEFAULT_FAL_MODEL } from '../lib/apiProfiles'
 import { CodeIcon } from './icons'
+import ViewportTooltip from './ViewportTooltip'
 
 interface Props {
   task: TaskRecord
@@ -13,6 +14,46 @@ interface Props {
   onDelete: () => void
   onClick: (e: React.MouseEvent | React.TouchEvent) => void
   isSelected?: boolean
+  disableSwipe?: boolean
+}
+
+function TaskActionButton({
+  tooltip,
+  className,
+  disabled = false,
+  onClick,
+  children,
+}: {
+  tooltip: string
+  className: string
+  disabled?: boolean
+  onClick?: () => void
+  children: ReactNode
+}) {
+  const [tooltipVisible, setTooltipVisible] = useState(false)
+
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => setTooltipVisible(true)}
+      onMouseLeave={() => setTooltipVisible(false)}
+      onFocus={() => setTooltipVisible(true)}
+      onBlur={() => setTooltipVisible(false)}
+    >
+      <button
+        type="button"
+        onClick={onClick}
+        className={className}
+        disabled={disabled}
+        aria-label={tooltip}
+      >
+        {children}
+      </button>
+      <ViewportTooltip visible={tooltipVisible} className="whitespace-nowrap">
+        {tooltip}
+      </ViewportTooltip>
+    </span>
+  )
 }
 
 export default function TaskCard({
@@ -22,6 +63,7 @@ export default function TaskCard({
   onDelete,
   onClick,
   isSelected,
+  disableSwipe,
 }: Props) {
   const [thumbSrc, setThumbSrc] = useState<string>('')
   const [coverRatio, setCoverRatio] = useState<string>('')
@@ -43,7 +85,7 @@ export default function TaskCard({
   }
 
   const handleTouchStart = (e: React.TouchEvent) => {
-    if (isTagScrollTarget(e.target)) {
+    if (disableSwipe || isTagScrollTarget(e.target)) {
       touchStartRef.current = null
       horizontalSwipeRef.current = false
       setIsSwiping(false)
@@ -204,7 +246,8 @@ export default function TaskCard({
   const showFormat = task.params.output_format !== 'png' || formatDisplay.isMismatch
 
   const nDisplay = getParamDisplay(task, 'n')
-  const showN = task.params.n > 1 || nDisplay.isMismatch
+  const isAgentTask = task.sourceMode === 'agent' || Boolean(task.agentConversationId || task.agentRoundId)
+  const showN = !isAgentTask && (task.params.n > 1 || nDisplay.isMismatch)
 
   const defaultModelForProvider = task.apiProvider === 'fal' ? DEFAULT_FAL_MODEL : DEFAULT_IMAGES_MODEL
   const showModel = task.apiModel && task.apiModel !== defaultModelForProvider
@@ -253,6 +296,25 @@ export default function TaskCard({
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
         onTouchCancel={handleTouchCancel}
+        draggable={task.status === 'done' && task.outputImages?.length > 0}
+        onDragStart={(e) => {
+          if (task.status !== 'done' || !task.outputImages?.length) return;
+          const imageIds = task.outputImages;
+          e.dataTransfer.setData('text/plain', `agent-images:${imageIds.join(',')}`);
+          e.dataTransfer.effectAllowed = 'copy';
+          // Optionally set drag image if we have thumbSrc
+          if (thumbSrc) {
+            const preview = document.createElement('div');
+            preview.style.cssText = 'position:fixed;left:-1000px;top:-1000px;width:100px;height:100px;border-radius:12px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.25);';
+            const previewImg = document.createElement('img');
+            previewImg.src = thumbSrc;
+            previewImg.style.cssText = 'width:100px;height:100px;object-fit:cover;display:block;';
+            preview.appendChild(previewImg);
+            document.body.appendChild(preview);
+            e.dataTransfer.setDragImage(preview, 50, 50);
+            setTimeout(() => preview.remove(), 0);
+          }
+        }}
       >
         {/* 选中时的角标 */}
       {isSelected && (
@@ -334,6 +396,7 @@ export default function TaskCard({
               <img
                 src={thumbSrc}
                 data-image-id={task.outputImages[0]}
+                data-output-image-ids={task.outputImages.join(',')}
                 className="saveable-image w-full h-full object-cover"
                 loading="lazy"
                 alt=""
@@ -462,21 +525,27 @@ export default function TaskCard({
             </div>
             {/* 操作按钮 */}
             <div
-              className="flex w-full items-center justify-between flex-shrink-0 mt-0.5 sm:w-auto sm:justify-end sm:gap-1"
+              data-tag-scroll-area
+              className="flex items-center gap-1 flex-shrink-0 mt-0.5 ml-auto max-w-full overflow-x-auto hide-scrollbar mask-edge-r pr-2"
               onClick={(e) => e.stopPropagation()}
+              onTouchStart={(e) => e.stopPropagation()}
+              onTouchMove={(e) => e.stopPropagation()}
+              onTouchEnd={(e) => e.stopPropagation()}
+              onTouchCancel={(e) => e.stopPropagation()}
             >
               {((task.status === 'error' && !isFalReconnecting) || settings.alwaysShowRetryButton) && (
-                <button
+                <TaskActionButton
+                  tooltip="重试任务"
                   onClick={() => retryTask(task)}
                   className="p-1.5 rounded-md hover:bg-blue-50 dark:hover:bg-blue-950/30 text-gray-400 hover:text-blue-500 transition"
-                  title="重试任务"
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                </button>
+                </TaskActionButton>
               )}
-              <button
+              <TaskActionButton
+                tooltip={task.isFavorite ? '取消收藏' : '收藏记录'}
                 onClick={() =>
                   updateTaskInStore(task.id, { isFavorite: !task.isFavorite })
                 }
@@ -485,7 +554,6 @@ export default function TaskCard({
                     ? 'text-yellow-400 hover:bg-yellow-50 dark:hover:bg-yellow-500/10'
                     : 'text-gray-400 hover:text-yellow-400 hover:bg-yellow-50 dark:hover:bg-yellow-500/10'
                 }`}
-                title={task.isFavorite ? '取消收藏' : '收藏记录'}
               >
                 <svg
                   className="w-4 h-4"
@@ -500,11 +568,11 @@ export default function TaskCard({
                     d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"
                   />
                 </svg>
-              </button>
-              <button
+              </TaskActionButton>
+              <TaskActionButton
+                tooltip="复用配置"
                 onClick={onReuse}
                 className="p-1.5 rounded-md hover:bg-blue-50 dark:hover:bg-blue-950/30 text-gray-400 hover:text-blue-500 transition"
-                title="复用配置"
               >
                 <svg
                   className="w-4 h-4"
@@ -519,11 +587,11 @@ export default function TaskCard({
                     d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"
                   />
                 </svg>
-              </button>
-              <button
+              </TaskActionButton>
+              <TaskActionButton
+                tooltip="编辑输出"
                 onClick={onEditOutputs}
                 className="p-1.5 rounded-md hover:bg-green-50 dark:hover:bg-green-950/30 text-gray-400 hover:text-green-500 transition disabled:opacity-30"
-                title="编辑输出"
                 disabled={!task.outputImages?.length}
               >
                 <svg
@@ -539,11 +607,11 @@ export default function TaskCard({
                     d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
                   />
                 </svg>
-              </button>
-              <button
+              </TaskActionButton>
+              <TaskActionButton
+                tooltip="删除记录"
                 onClick={onDelete}
                 className="p-1.5 rounded-md hover:bg-red-50 dark:hover:bg-red-950/30 text-gray-400 hover:text-red-500 transition"
-                title="删除记录"
               >
                 <svg
                   className="w-4 h-4"
@@ -558,7 +626,7 @@ export default function TaskCard({
                     d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
                   />
                 </svg>
-              </button>
+              </TaskActionButton>
             </div>
           </div>
         </div>

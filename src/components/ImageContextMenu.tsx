@@ -1,10 +1,11 @@
 import React, { useEffect, useState, useRef } from 'react'
 import { useStore, addImageFromUrl, ensureImageCached } from '../store'
 import { copyBlobToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
+import { downloadImageIds } from '../lib/downloadImages'
 import { CopyIcon, DownloadIcon, EditIcon } from './icons'
 
 export default function ImageContextMenu() {
-  const [menuInfo, setMenuInfo] = useState<{ src: string; imageId?: string; x: number; y: number } | null>(null)
+  const [menuInfo, setMenuInfo] = useState<{ src: string; imageId?: string; outputImageIds: string[]; x: number; y: number } | null>(null)
   const showToast = useStore((s) => s.showToast)
   const inputImages = useStore((s) => s.inputImages)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
@@ -31,6 +32,7 @@ export default function ImageContextMenu() {
         setMenuInfo({
           src: imgTarget.src,
           imageId: imgTarget.dataset.imageId,
+          outputImageIds: imgTarget.dataset.outputImageIds?.split(',').filter(Boolean) ?? [],
           x: e.clientX,
           y: e.clientY,
         })
@@ -115,6 +117,28 @@ export default function ImageContextMenu() {
     }
   }
 
+  const handleDownloadAll = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    const outputImageIds = menuInfo.outputImageIds
+    setMenuInfo(null)
+    if (outputImageIds.length === 0) return
+
+    try {
+      showToast(outputImageIds.length > 1 ? `开始下载 ${outputImageIds.length} 张图片...` : '开始下载', 'info')
+      const result = await downloadImageIds(outputImageIds, 'outputs')
+      if (result.successCount === 0) {
+        showToast('下载失败', 'error')
+      } else if (result.failCount > 0) {
+        showToast(`下载完成：成功 ${result.successCount}，失败 ${result.failCount}`, 'info')
+      } else {
+        showToast(outputImageIds.length > 1 ? `已开始下载 ${result.successCount} 张图片` : '开始下载', 'success')
+      }
+    } catch (err) {
+      console.error(err)
+      showToast('下载失败', 'error')
+    }
+  }
+
   const handleEdit = async (e: React.MouseEvent) => {
     e.stopPropagation()
     setMenuInfo(null)
@@ -140,7 +164,7 @@ export default function ImageContextMenu() {
   let left = menuInfo.x
   let top = menuInfo.y
   const MENU_WIDTH = 120
-  const MENU_HEIGHT = 128 // 三个按钮高度加 padding
+  const MENU_HEIGHT = menuInfo.outputImageIds.length > 0 ? 160 : 128
 
   if (left + MENU_WIDTH > window.innerWidth) {
     left -= MENU_WIDTH
@@ -170,6 +194,15 @@ export default function ImageContextMenu() {
         <DownloadIcon className="w-4 h-4 flex-shrink-0" />
         下载
       </button>
+      {menuInfo.outputImageIds.length > 0 && (
+        <button
+          onClick={handleDownloadAll}
+          className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 flex items-center gap-2 transition-colors"
+        >
+          <DownloadIcon className="w-4 h-4 flex-shrink-0" />
+          下载全部
+        </button>
+      )}
       <button
         onClick={handleEdit}
         className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 flex items-center gap-2 transition-colors"

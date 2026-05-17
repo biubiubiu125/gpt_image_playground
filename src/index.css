@@ -213,6 +213,11 @@ input[type="number"] {
 }
 
 @media (max-width: 640px) {
+  html.agent-no-pull-refresh,
+  html.agent-no-pull-refresh body {
+    overscroll-behavior-y: contain;
+  }
+
   .safe-area-top {
     padding-top: max(0.5rem, var(--safe-area-top));
   }
