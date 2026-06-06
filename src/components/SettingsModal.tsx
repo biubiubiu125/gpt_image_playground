@@ -1159,7 +1159,7 @@ export default function SettingsModal() {
                   </button>
                 </div>
                 <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
-                  RK API中转站内支持image2生图分组的API密钥
+                  请填写 RK API 中转站内支持 gpt-image-2 生图模型分组的 API 密钥
                 </div>
               </div>
 
