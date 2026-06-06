@@ -30,6 +30,7 @@ export const DEFAULT_RESPONSES_MODEL = 'gpt-5.5'
 export const DEFAULT_FAL_BASE_URL = 'https://fal.run'
 export const DEFAULT_FAL_MODEL = 'openai/gpt-image-2'
 export const DEFAULT_OPENAI_PROFILE_ID = 'default-openai'
+export const RK_API_PROFILE_NAME = 'RK API'
 export const DEFAULT_API_TIMEOUT = 600
 
 const BUILT_IN_PROVIDER_IDS = new Set<ApiProvider>(['openai', 'fal'])
@@ -289,27 +290,27 @@ export function normalizeCustomProviderDefinitions(input: unknown): CustomProvid
 }
 
 export function createDefaultOpenAIProfile(overrides: Partial<ApiProfile> = {}): ApiProfile {
+  const apiMode = overrides.apiMode ?? 'images'
   return {
     id: DEFAULT_OPENAI_PROFILE_ID,
-    name: '默认',
     provider: 'openai',
     baseUrl: DEFAULT_BASE_URL,
     apiKey: '',
-    model: DEFAULT_IMAGES_MODEL,
+    model: apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL,
     timeout: DEFAULT_API_TIMEOUT,
-    apiMode: 'images',
+    apiMode,
     codexCli: false,
     apiProxy: DEFAULT_OPENAI_API_PROXY,
     streamImages: true,
     streamPartialImages: DEFAULT_STREAM_PARTIAL_IMAGES,
     ...overrides,
+    name: RK_API_PROFILE_NAME,
   }
 }
 
 export function createDefaultFalProfile(overrides: Partial<ApiProfile> = {}): ApiProfile {
   return {
     id: `fal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-    name: '新配置',
     provider: 'fal',
     baseUrl: DEFAULT_FAL_BASE_URL,
     apiKey: '',
@@ -321,6 +322,7 @@ export function createDefaultFalProfile(overrides: Partial<ApiProfile> = {}): Ap
     streamImages: false,
     streamPartialImages: DEFAULT_STREAM_PARTIAL_IMAGES,
     ...overrides,
+    name: RK_API_PROFILE_NAME,
   }
 }
 
@@ -343,6 +345,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
   if (provider === 'fal') {
     return {
       ...profile,
+      name: RK_API_PROFILE_NAME,
       provider,
       baseUrl: savedDraft?.baseUrl ?? DEFAULT_FAL_BASE_URL,
       model: savedDraft?.model ?? DEFAULT_FAL_MODEL,
@@ -360,6 +363,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
     const shouldUseOpenAIDefaults = profile.provider === 'fal'
     return {
       ...profile,
+      name: RK_API_PROFILE_NAME,
       provider: customProvider.id,
       baseUrl: savedDraft?.baseUrl ?? (shouldUseOpenAIDefaults ? DEFAULT_BASE_URL : profile.baseUrl || DEFAULT_BASE_URL),
       model: savedDraft?.model ?? (shouldUseOpenAIDefaults ? DEFAULT_IMAGES_MODEL : profile.model || DEFAULT_IMAGES_MODEL),
@@ -373,12 +377,14 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
     }
   }
 
+  const openAIApiMode = savedDraft?.apiMode ?? profile.apiMode
   return {
     ...profile,
+    name: RK_API_PROFILE_NAME,
     provider,
     baseUrl: savedDraft?.baseUrl ?? DEFAULT_BASE_URL,
-    model: savedDraft?.model ?? DEFAULT_IMAGES_MODEL,
-    apiMode: savedDraft?.apiMode ?? profile.apiMode,
+    model: savedDraft?.model ?? (openAIApiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL),
+    apiMode: openAIApiMode,
     codexCli: savedDraft?.codexCli ?? profile.codexCli,
     apiProxy: savedDraft?.apiProxy ?? DEFAULT_OPENAI_API_PROXY,
     responseFormatB64Json: savedDraft?.responseFormatB64Json,
@@ -424,14 +430,14 @@ export function normalizeApiProfile(input: unknown, fallback?: Partial<ApiProfil
   const record = input && typeof input === 'object' ? input as Record<string, unknown> : {}
   const rawProvider = typeof record.provider === 'string' ? record.provider : ''
   const provider: ApiProvider = rawProvider === 'fal' || customProviderIds.has(rawProvider) ? rawProvider : 'openai'
-  const defaults = provider === 'fal' ? createDefaultFalProfile(fallback) : createDefaultOpenAIProfile(fallback)
   const apiMode: ApiMode = record.apiMode === 'responses' ? 'responses' : 'images'
+  const defaults = provider === 'fal' ? createDefaultFalProfile(fallback) : createDefaultOpenAIProfile({ ...fallback, apiMode })
   const rawBaseUrl = typeof record.baseUrl === 'string' ? record.baseUrl : defaults.baseUrl
 
   return {
     ...defaults,
     id: typeof record.id === 'string' && record.id.trim() ? record.id : defaults.id,
-    name: typeof record.name === 'string' && record.name.trim() ? record.name : defaults.name,
+    name: RK_API_PROFILE_NAME,
     provider,
     baseUrl: provider === 'fal' ? rawBaseUrl.trim().replace(/\/+$/, '') || DEFAULT_FAL_BASE_URL : rawBaseUrl,
     apiKey: typeof record.apiKey === 'string' ? record.apiKey : defaults.apiKey,
@@ -464,12 +470,13 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
   const record = input && typeof input === 'object' ? input as Record<string, unknown> : {}
   const customProviders = normalizeCustomProviderDefinitions(record.customProviders)
   const customProviderIds = new Set(customProviders.map((provider) => provider.id))
+  const legacyApiMode = record.apiMode === 'responses' ? 'responses' : 'images'
   const legacyProfile = createDefaultOpenAIProfile({
     baseUrl: typeof record.baseUrl === 'string' ? record.baseUrl : DEFAULT_BASE_URL,
     apiKey: typeof record.apiKey === 'string' ? record.apiKey : '',
-    model: typeof record.model === 'string' && record.model.trim() ? record.model : DEFAULT_IMAGES_MODEL,
+    ...(typeof record.model === 'string' && record.model.trim() ? { model: record.model } : {}),
     timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : DEFAULT_API_TIMEOUT,
-    apiMode: record.apiMode === 'responses' ? 'responses' : 'images',
+    apiMode: legacyApiMode,
     codexCli: Boolean(record.codexCli),
     apiProxy: typeof record.apiProxy === 'boolean' ? record.apiProxy : DEFAULT_OPENAI_API_PROXY,
     responseFormatB64Json: record.responseFormatB64Json === true ? true : undefined,
@@ -616,7 +623,7 @@ export function validateApiProfile(profile: ApiProfile): string | null {
 
 function isDefaultOpenAIProfile(profile: ApiProfile): boolean {
   return profile.id === DEFAULT_OPENAI_PROFILE_ID &&
-    profile.name === '默认' &&
+    profile.name === RK_API_PROFILE_NAME &&
     profile.provider === 'openai' &&
     profile.baseUrl === DEFAULT_BASE_URL &&
     profile.apiKey === '' &&

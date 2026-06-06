@@ -3,7 +3,9 @@ import {
   createDefaultFalProfile,
   createDefaultOpenAIProfile,
   DEFAULT_IMAGES_MODEL,
+  DEFAULT_RESPONSES_MODEL,
   DEFAULT_SETTINGS,
+  RK_API_PROFILE_NAME,
   normalizeSettings,
 } from './apiProfiles'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './urlSettings'
@@ -19,7 +21,7 @@ describe('URL settings params', () => {
     expect(next.profiles).toHaveLength(2)
     expect(next.activeProfileId).not.toBe(current.activeProfileId)
     expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
-      name: 'URL 参数配置',
+      name: RK_API_PROFILE_NAME,
       provider: 'openai',
       baseUrl: 'https://api.example.com/v1',
       apiKey: 'test-key',
@@ -40,6 +42,20 @@ describe('URL settings params', () => {
       apiKey: 'test-key',
       model: 'custom-image-model',
       apiMode: 'images',
+    })
+  })
+
+  it('uses the Responses model default when Responses API is selected from URL params', () => {
+    const current = normalizeSettings(DEFAULT_SETTINGS)
+    const next = normalizeSettings({
+      ...current,
+      ...buildSettingsFromUrlParams(current, new URLSearchParams('apiUrl=https://api.example.com/v1&apiKey=test-key&apiMode=responses')),
+    })
+
+    expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
+      provider: 'openai',
+      apiMode: 'responses',
+      model: DEFAULT_RESPONSES_MODEL,
     })
   })
 

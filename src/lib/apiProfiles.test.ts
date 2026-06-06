@@ -4,7 +4,9 @@ import {
   DEFAULT_FAL_MODEL,
   DEFAULT_IMAGES_MODEL,
   DEFAULT_OPENAI_PROFILE_ID,
+  DEFAULT_RESPONSES_MODEL,
   DEFAULT_SETTINGS,
+  RK_API_PROFILE_NAME,
   createDefaultOpenAIProfile,
   createDefaultFalProfile,
   findEquivalentApiProfile,
@@ -40,6 +42,15 @@ describe('validateApiProfile', () => {
   })
 })
 
+describe('createDefaultOpenAIProfile', () => {
+  it('uses the Responses default model when the profile starts in Responses mode', () => {
+    expect(createDefaultOpenAIProfile({ apiMode: 'responses' })).toMatchObject({
+      apiMode: 'responses',
+      model: DEFAULT_RESPONSES_MODEL,
+    })
+  })
+})
+
 describe('mergeImportedSettings', () => {
   it('replaces the default OpenAI profile with legacy imported settings when current settings are untouched', () => {
     const merged = mergeImportedSettings(DEFAULT_SETTINGS, {
@@ -64,6 +75,19 @@ describe('mergeImportedSettings', () => {
       apiMode: 'responses',
       codexCli: true,
       apiProxy: true,
+    })
+  })
+
+  it('uses Responses default model for legacy imported Responses settings without a model', () => {
+    const merged = mergeImportedSettings(DEFAULT_SETTINGS, {
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'imported-key',
+      apiMode: 'responses',
+    })
+
+    expect(merged.profiles[0]).toMatchObject({
+      apiMode: 'responses',
+      model: DEFAULT_RESPONSES_MODEL,
     })
   })
 
@@ -201,8 +225,8 @@ describe('mergeImportedSettings', () => {
     expect(merged.profiles).toHaveLength(3)
     expect(merged.activeProfileId).toBe(DEFAULT_OPENAI_PROFILE_ID)
     expect(merged.profiles[0]).toMatchObject({ apiKey: 'current-key', model: 'current-model' })
-    expect(merged.profiles[1]).toMatchObject({ name: 'Imported OpenAI', provider: 'openai', apiKey: 'imported-key' })
-    expect(merged.profiles[2]).toMatchObject({ name: 'Imported fal', provider: 'fal', apiKey: 'fal-key' })
+    expect(merged.profiles[1]).toMatchObject({ name: RK_API_PROFILE_NAME, provider: 'openai', apiKey: 'imported-key' })
+    expect(merged.profiles[2]).toMatchObject({ name: RK_API_PROFILE_NAME, provider: 'fal', apiKey: 'fal-key' })
     expect(new Set(merged.profiles.map((profile) => profile.id)).size).toBe(3)
   })
 
@@ -500,7 +524,7 @@ describe('custom providers', () => {
 
     expect(imported.customProviders[0]).toMatchObject({ id: 'custom-json', name: 'Custom JSON' })
     expect(imported.profiles[0]).toMatchObject({
-      name: 'Custom JSON',
+      name: RK_API_PROFILE_NAME,
       provider: 'custom-json',
       baseUrl: 'https://custom.example.com/v1',
       apiKey: '',

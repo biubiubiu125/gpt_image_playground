@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
-import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
+import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, RK_API_PROFILE_NAME, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
@@ -1837,7 +1837,7 @@ describe('reused task API profile', () => {
     expect(state.tasks).toEqual([])
     expect(state.setConfirmDialog).toHaveBeenCalledWith(expect.objectContaining({
       title: '找不到 API 配置',
-      message: '找不到复用任务所使用的 API 配置「未知配置」，要使用当前的 API 配置「默认」提交任务吗？',
+      message: `找不到复用任务所使用的 API 配置「未知配置」，要使用当前的 API 配置「${RK_API_PROFILE_NAME}」提交任务吗？`,
       confirmText: '使用当前配置提交',
       cancelText: '放弃提交',
     }))

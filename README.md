@@ -2,9 +2,7 @@
 
 # 🎨 GPT Image Playground
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/CookSleep/gpt_image_playground?style=flat-square&color=eab308)](https://github.com/CookSleep/gpt_image_playground/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/CookSleep/gpt_image_playground?style=flat-square&color=3b82f6)](https://github.com/CookSleep/gpt_image_playground/network/members)
-[![License](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](https://github.com/CookSleep/gpt_image_playground/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](LICENSE)
 [![React](https://img.shields.io/badge/React-19-20232A?style=flat-square&logo=react&logoColor=61DAFB)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
@@ -12,12 +10,6 @@
 
 提供简洁精美的 Web UI，支持 OpenAI / OpenAI 兼容接口、fal.ai 与可导入的自定义 HTTP 服务商。<br>
 支持文本生图、参考图与遮罩编辑，数据纯本地化存储，带来流畅的历史记录与参数管理体验。
-
-<br>
-
-[![Vercel 在线体验](https://img.shields.io/badge/Vercel-%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-black?style=for-the-badge&logo=vercel&logoColor=white)](https://gpt-image-playground.cooksleep.dev)
-&nbsp;&nbsp;&nbsp;
-[![GitHub Pages 在线体验](https://img.shields.io/badge/GitHub%20Pages-%E5%9C%A8%E7%BA%BF%E4%BD%93%E9%AA%8C-222222?style=for-the-badge&logo=github&logoColor=white)](https://cooksleep.github.io/gpt_image_playground)
 
 </div>
 
@@ -119,9 +111,7 @@
 <details>
 <summary><strong>▲ 方式一：Vercel 一键部署 (推荐)</strong></summary>
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FCookSleep%2Fgpt_image_playground&project-name=gpt-image-playground&repository-name=gpt-image-playground)
-
-点击上方按钮导入仓库即可，Vercel 会自动执行构建并部署静态文件。
+将当前仓库导入 Vercel 后，Vercel 会自动执行构建并部署静态文件。
 
 **配置默认 API URL**：在 Vercel 项目的 **Settings → Environment Variables** 中添加 `VITE_DEFAULT_API_URL`（如 `https://api.openai.com/v1`），然后重新部署即可生效。
 
@@ -178,7 +168,7 @@ $env:VITE_DEFAULT_API_URL="https://api.openai.com/v1"; npm run deploy:cf
 <details>
 <summary><strong>🐳 方式三：Docker 部署</strong></summary>
 
-官方镜像已发布至 GitHub Container Registry。Docker 部署支持在运行时注入默认配置。
+Docker 部署支持在运行时注入默认配置。你可以直接在服务器上构建镜像，也可以在 CI 中构建后推送到私有镜像仓库。
 
 **环境变量说明：**
 
@@ -203,26 +193,87 @@ $env:VITE_DEFAULT_API_URL="https://api.openai.com/v1"; npm run deploy:cf
 
 > 💡 **兼容迁移**：旧版本中的 `API_URL` 已拆分为 `DEFAULT_API_URL` 和 `API_PROXY_URL`。容器启动时会自动将遗留的 `API_URL` 作为两个新变量的兜底值，实现无缝兼容。建议更新配置文件，逐步迁移至新变量。
 
-**1. Docker CLI 示例**
+**1. 构建镜像**
+
+在项目根目录执行：
 
 ```bash
-docker run -d -p 8080:80 \
+docker build -f deploy/Dockerfile -t gpt-image-playground:latest .
+```
+
+如果服务器使用旧版 Docker legacy builder，且不支持 `FROM --platform=$BUILDPLATFORM` 或 `COPY --chmod`，可使用兼容 Dockerfile：
+
+```Dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+ENV VITE_DEFAULT_API_URL=__VITE_DEFAULT_API_URL_PLACEHOLDER__
+ENV VITE_API_PROXY_AVAILABLE=__VITE_API_PROXY_AVAILABLE_PLACEHOLDER__
+ENV VITE_API_PROXY_LOCKED=__VITE_API_PROXY_LOCKED_PLACEHOLDER__
+ENV VITE_DOCKER_DEPLOYMENT=__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__
+ENV VITE_DOCKER_LEGACY_API_URL_USED=__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+ENV HOST=0.0.0.0
+ENV PORT=80
+ENV DEFAULT_API_URL=
+ENV API_PROXY_URL=
+ENV ENABLE_API_PROXY=false
+ENV LOCK_API_PROXY=false
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY deploy/nginx.conf /etc/nginx/templates/default.conf.template
+COPY deploy/migrate-api-env.envsh /docker-entrypoint.d/05-migrate-api-env.envsh
+COPY deploy/inject-api-url.sh /docker-entrypoint.d/40-inject-api-url.sh
+RUN chmod +x /docker-entrypoint.d/05-migrate-api-env.envsh /docker-entrypoint.d/40-inject-api-url.sh
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+将上述内容保存为 `Dockerfile.compat` 后构建：
+
+```bash
+docker build -f Dockerfile.compat -t gpt-image-playground:latest .
+```
+
+Windows 环境打包上传到 Linux 服务器时，需确保 `deploy/*.sh`、`deploy/*.envsh` 与 `deploy/nginx.conf` 为 LF 换行：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+for p in [Path('deploy/inject-api-url.sh'), Path('deploy/migrate-api-env.envsh'), Path('deploy/nginx.conf')]:
+    p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n').replace(b'\r', b'\n'))
+PY
+```
+
+**2. Docker CLI 启动**
+
+```bash
+docker run -d \
+  --name gpt-image-playground \
+  --restart unless-stopped \
+  -p 8080:80 \
   -e DEFAULT_API_URL=https://api.openai.com/v1 \
   -e ENABLE_API_PROXY=true \
   -e LOCK_API_PROXY=true \
   -e API_PROXY_URL=https://api.openai.com/v1 \
-  ghcr.io/cooksleep/gpt_image_playground:latest
+  gpt-image-playground:latest
 ```
 
 **隐藏真实 API 地址示例（OpenAI 兼容接口）：**
 
 ```bash
-docker run -d -p 8080:80 \
+docker run -d \
+  --name gpt-image-playground \
+  --restart unless-stopped \
+  -p 8080:80 \
   -e DEFAULT_API_URL= \
   -e API_PROXY_URL=https://real-api.example.com/v1 \
   -e ENABLE_API_PROXY=true \
   -e LOCK_API_PROXY=true \
-  ghcr.io/cooksleep/gpt_image_playground:latest
+  gpt-image-playground:latest
 ```
 
 > 上例中设置页的 API URL 为空，实际请求通过代理转发到 `API_PROXY_URL`。
@@ -230,34 +281,104 @@ docker run -d -p 8080:80 \
 **隐藏真实 API 地址示例（同步自定义服务商配置）：**
 
 ```bash
-docker run -d -p 8080:80 \
+docker run -d \
+  --name gpt-image-playground \
+  --restart unless-stopped \
+  -p 8080:80 \
   -e DEFAULT_API_URL='https://example.com/?settings={"customProviders":[...],"profiles":[{"baseUrl":"","apiProxy":true,...}]}' \
   -e API_PROXY_URL=https://real-api.example.com/v1 \
   -e ENABLE_API_PROXY=true \
   -e LOCK_API_PROXY=true \
-  ghcr.io/cooksleep/gpt_image_playground:latest
+  gpt-image-playground:latest
 ```
 
 > 上例中 `DEFAULT_API_URL` 为同步自定义服务商配置分享 URL，profile 的 `baseUrl` 留空且 `apiProxy:true`；真实 API 地址仅在 `API_PROXY_URL` 中配置，前端不可见。异步任务自定义服务商暂不支持开启代理。
 
 *(注：使用 host 网络时加 `--network host`，修改容器监听端口使用 `-e PORT=28080`)*
 
-**2. Docker Compose 示例**
+**3. Docker Compose 示例**
 
 ```yaml
+version: "3.8"
 services:
   gpt-image-playground:
-    image: ghcr.io/cooksleep/gpt_image_playground:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: gpt-image-playground:latest
+    container_name: gpt-image-playground
     environment:
-      - DEFAULT_API_URL=https://api.openai.com/v1
+      DEFAULT_API_URL: "https://api.openai.com/v1"
+      ENABLE_API_PROXY: "true"
+      LOCK_API_PROXY: "false"
+      API_PROXY_URL: "https://api.openai.com/v1"
     ports:
       - "8080:80"
     restart: unless-stopped
 ```
 
-**更新说明：**
+使用本地源码构建并启动时，新版本 Docker Compose 使用：
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
+旧版 `docker-compose` 使用：
+
+```bash
+docker-compose up -d --build --force-recreate
+```
+
+如果旧版 `docker-compose 1.29.x` 在重建时出现 `KeyError: 'ContainerConfig'`，可先删除旧容器后再启动：
+
+```bash
+docker rm -f gpt-image-playground || true
+docker-compose up -d --no-build --force-recreate
+```
+
+如果你已经从镜像仓库拉取镜像，不需要本地构建，可删除上方 `build` 配置并保留 `image`。仍然失败时，可绕开 compose 直接运行已经构建好的镜像：
+
+```bash
+docker run -d \
+  --name gpt-image-playground \
+  --restart unless-stopped \
+  -p 8080:80 \
+  -e DEFAULT_API_URL=https://api.openai.com/v1 \
+  -e ENABLE_API_PROXY=true \
+  -e LOCK_API_PROXY=false \
+  -e API_PROXY_URL=https://api.openai.com/v1 \
+  gpt-image-playground:latest
+```
+
+**4. 验证部署**
+
+```bash
+curl -I http://127.0.0.1:8080/
+curl -s http://127.0.0.1:8080/prompts/rk-text-image-prompts.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['totalCount'], d['version'], len(d['chunks']))"
+docker logs --tail 50 gpt-image-playground
+```
+
+提示词库采用轻量索引 + 分片文件：首次打开只加载 `prompts/rk-text-image-prompts.json`，完整提示词按需从 `prompts/rk-text-image-prompts/chunk-*.json` 继续加载。部署静态文件时不要漏传 `public/prompts/rk-text-image-prompts/` 目录。索引文件建议使用 `no-cache`，分片文件可短期缓存，避免用户一直看到旧版提示词数量。
+
+**5. 更新与回滚**
 
 使用 `latest` 标签时，重新拉取镜像并重启即可更新（如 `docker compose pull && docker compose up -d`）。若需固定版本可使用官方提供的版本号标签（如 `0.2.x`）。
+
+手动部署到服务器目录时，建议先在新目录构建成功，再替换旧目录：
+
+```bash
+rm -rf /opt/gpt_image_playground.new
+mkdir -p /opt/gpt_image_playground.new
+tar -xzf gpt_image_playground_deploy.tgz -C /opt/gpt_image_playground.new
+cd /opt/gpt_image_playground.new
+docker compose build
+cd /opt
+rm -rf gpt_image_playground.bak
+mv gpt_image_playground gpt_image_playground.bak
+mv gpt_image_playground.new gpt_image_playground
+cd gpt_image_playground
+docker compose up -d --force-recreate
+```
 
 </details>
 
@@ -322,11 +443,11 @@ npm run build
 例如，集成到 New API 的聊天系统：
 
 ```text
-https://gpt-image-playground.cooksleep.dev?apiUrl={address}&apiKey={key}&model={model}
+https://your-domain.example?apiUrl={address}&apiKey={key}&model={model}
 ```
 
 ```text
-https://cooksleep.github.io/gpt_image_playground?apiUrl={address}&apiKey={key}&model={model}
+http://localhost:5173?apiUrl={address}&apiKey={key}&model={model}
 ```
 
 **方式二：自定义格式服务商**
@@ -337,10 +458,7 @@ https://cooksleep.github.io/gpt_image_playground?apiUrl={address}&apiKey={key}&m
 >
 > **设置 - API 配置 - 服务商类型 - 创建自定义服务商 - AI 一键生成与导入**
 >
-> 完成后可在 **API 配置 - 当前配置** 使用右侧快捷按钮：
->
-> - **链接按钮**：复制可导入配置的 URL。复制时可选择不包含 API Key，并使用 `{address}`、`{key}`、`{model}` 等变量，便于在 New API 等平台中集成分享。
-> - **复制按钮**：将当前配置复制一份到配置列表底部，新配置名称会追加“（复制）”。
+> 完成后会导入服务商配置，并可在 **API 配置** 中调整 API URL、API Key 与模型 ID。
 
 JSON 结构示例：
 
@@ -415,33 +533,3 @@ JSON 结构示例：
 本项目基于 [MIT License](LICENSE) 开源。
 
 特别致谢：[LINUX DO](https://linux.do)
-
-## 💜 赞助支持
-
-<div align="center">
-
-如果这个项目对你有帮助，欢迎通过爱发电赞助支持，你的每一份鼓励都是持续更新的动力！
-
-<br>
-<br>
-
-<a href="https://www.ifdian.net/a/cooksleep">
-  <img src="https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-%E8%B5%9E%E5%8A%A9%E4%BD%9C%E8%80%85-946ce6?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAyMS4zNWwtMS40NS0xLjMyQzUuNCAxNS4zNiAyIDEyLjI4IDIgOC41IDIgNS40MiA0LjQyIDMgNy41IDNjMS43NCAwIDMuNDEuODEgNC41IDIuMDlDMTMuMDkgMy44MSAxNC43NiAzIDE2LjUgMyAxOS41OCAzIDIyIDUuNDIgMjIgOC41YzAgMy43OC0zLjQgNi44Ni04LjU1IDExLjU0TDEyIDIxLjM1eiIvPjwvc3ZnPg==&logoColor=white" alt="爱发电赞助" />
-</a>
-
-<br>
-<br>
-
-</div>
-
-## ⭐ Star History
-
-<div align="center">
-  <a href="https://www.star-history.com/#CookSleep/gpt_image_playground&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=CookSleep/gpt_image_playground&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=CookSleep/gpt_image_playground&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=CookSleep/gpt_image_playground&type=Date" />
-    </picture>
-  </a>
-</div>

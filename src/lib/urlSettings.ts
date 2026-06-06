@@ -102,7 +102,6 @@ export function buildSettingsFromUrlParams(currentSettings: Partial<AppSettings>
     const profileApiMode = apiMode ?? 'images'
     const profile = createDefaultOpenAIProfile({
       id: createUrlProfileId(new Set(settings.profiles.map((item) => item.id))),
-      name: 'URL 参数配置',
       apiMode: profileApiMode,
       model: profileApiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL,
     })

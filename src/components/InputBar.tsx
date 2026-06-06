@@ -16,7 +16,8 @@ import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getT
 import Select from './Select'
 import SizePickerModal from './SizePickerModal'
 import ViewportTooltip from './ViewportTooltip'
-import { CloseIcon } from './icons'
+import PromptLibraryModal from './PromptLibraryModal'
+import { BookOpenIcon, CloseIcon } from './icons'
 
 
 function getMentionTagTextLength(el: Element) {
@@ -674,9 +675,11 @@ export default function InputBar() {
   const [isSingleLine, setIsSingleLine] = useState(true)
   const [submitHover, setSubmitHover] = useState(false)
   const [attachHover, setAttachHover] = useState(false)
+  const [promptLibraryHover, setPromptLibraryHover] = useState(false)
   const [imageHintId, setImageHintId] = useState<string | null>(null)
   const [mobileCollapsed, setMobileCollapsed] = useState(false)
   const [showSizePicker, setShowSizePicker] = useState(false)
+  const [showPromptLibrary, setShowPromptLibrary] = useState(false)
   const [showMobileUploadMenu, setShowMobileUploadMenu] = useState(false)
   const [maskPreviewUrl, setMaskPreviewUrl] = useState('')
   const [imageDragIndex, setImageDragIndex] = useState<number | null>(null)
@@ -938,6 +941,17 @@ export default function InputBar() {
       textareaRef.current.innerHTML = ''
       textareaRef.current.focus()
     }
+  }, [setPrompt])
+
+  const handleUseLibraryPrompt = useCallback((libraryPrompt: string) => {
+    isUserInputRef.current = false
+    setPrompt(libraryPrompt)
+    window.setTimeout(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.focus()
+      setContentEditableCursor(el, libraryPrompt.length)
+    }, 0)
   }, [setPrompt])
 
   useEffect(() => {
@@ -2409,13 +2423,29 @@ export default function InputBar() {
               <div className="flex gap-2 flex-shrink-0 mb-0.5">
                 <div
                   className="relative"
+                  onMouseEnter={() => setPromptLibraryHover(true)}
+                  onMouseLeave={() => setPromptLibraryHover(false)}
+                >
+                  <ButtonTooltip visible={promptLibraryHover} text="提示词库" />
+                  <button
+                    type="button"
+                    onClick={() => setShowPromptLibrary(true)}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-gray-200 px-3 py-2.5 text-xs font-medium text-gray-600 shadow-sm transition-all hover:bg-gray-300 hover:shadow dark:bg-white/[0.06] dark:text-gray-300 dark:hover:bg-white/[0.1]"
+                    aria-label="打开提示词库"
+                  >
+                    <BookOpenIcon className="w-5 h-5" />
+                    <span>提示词库</span>
+                  </button>
+                </div>
+                <div
+                  className="relative"
                   onMouseEnter={() => setAttachHover(true)}
                   onMouseLeave={() => setAttachHover(false)}
                 >
                   <ButtonTooltip visible={attachHover} text={uploadImageTooltipText} />
                   <button
                     onClick={() => !atImageLimit && fileInputRef.current?.click()}
-                    className={`p-2.5 rounded-xl transition-all shadow-sm ${
+                    className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-xs font-medium transition-all shadow-sm ${
                       atImageLimit
                         ? 'bg-gray-200 dark:bg-white/[0.04] text-gray-300 dark:text-gray-500 cursor-not-allowed'
                         : 'bg-gray-200 dark:bg-white/[0.06] hover:bg-gray-300 dark:hover:bg-white/[0.1] text-gray-500 dark:text-gray-300 hover:shadow'
@@ -2425,6 +2455,7 @@ export default function InputBar() {
                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
                     </svg>
+                    <span>参考图</span>
                   </button>
                 </div>
                 <div
@@ -2436,7 +2467,7 @@ export default function InputBar() {
                   <button
                     onClick={() => activeAgentIsRunning ? stopActiveAgentResponse() : hasSubmitApiConfig ? submitCurrentMode() : setShowSettings(true)}
                     disabled={activeAgentIsRunning ? false : hasSubmitApiConfig ? !canSubmit : false}
-                    className={`p-2.5 rounded-xl transition-all shadow-sm hover:shadow ${
+                    className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-xs font-medium transition-all shadow-sm hover:shadow ${
                       activeAgentIsRunning
                         ? 'bg-red-500 text-white hover:bg-red-600'
                         : !hasSubmitApiConfig
@@ -2454,6 +2485,7 @@ export default function InputBar() {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
                       </svg>
                     )}
+                    <span>{activeAgentIsRunning ? '停止生成' : '生成图片'}</span>
                   </button>
                 </div>
               </div>
@@ -2469,6 +2501,16 @@ export default function InputBar() {
               </div>
 
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowPromptLibrary(true)}
+                  className="inline-flex flex-col items-center justify-center gap-0.5 rounded-xl bg-gray-200 px-2.5 py-2 text-[11px] font-medium leading-none text-gray-500 shadow-sm transition-all hover:bg-gray-300 dark:bg-white/[0.06] dark:text-gray-300 dark:hover:bg-white/[0.1]"
+                  aria-label="打开提示词库"
+                  title="提示词库"
+                >
+                  <BookOpenIcon className="w-5 h-5" />
+                  <span>提示词库</span>
+                </button>
                 <div
                   className="relative"
                   onMouseEnter={() => setAttachHover(true)}
@@ -2480,7 +2522,7 @@ export default function InputBar() {
                         setShowMobileUploadMenu(!showMobileUploadMenu)
                       }
                     }}
-                    className={`p-2.5 rounded-xl transition-all shadow-sm flex-shrink-0 ${
+                    className={`inline-flex flex-shrink-0 flex-col items-center justify-center gap-0.5 rounded-xl px-2.5 py-2 text-[11px] font-medium leading-none transition-all shadow-sm ${
                       atImageLimit
                         ? 'bg-gray-200 dark:bg-white/[0.04] text-gray-300 dark:text-gray-500 cursor-not-allowed'
                         : 'bg-gray-200 dark:bg-white/[0.06] hover:bg-gray-300 dark:hover:bg-white/[0.1] text-gray-500 dark:text-gray-300'
@@ -2495,6 +2537,7 @@ export default function InputBar() {
                     >
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
                     </svg>
+                    <span>参考图</span>
                   </button>
 
                   {/* Mobile Upload Menu */}
@@ -2561,7 +2604,7 @@ export default function InputBar() {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
                       </svg>
                     )}
-                    {activeAgentIsRunning ? '停止生成' : maskDraft ? '遮罩编辑' : '生成图像'}
+                    {activeAgentIsRunning ? '停止生成' : maskDraft ? '遮罩编辑' : '生成图片'}
                   </button>
                 </div>
               </div>
@@ -2591,6 +2634,12 @@ export default function InputBar() {
             className="hidden"
             onChange={handleReplaceFileUpload}
           />
+          {showPromptLibrary && (
+            <PromptLibraryModal
+              onClose={() => setShowPromptLibrary(false)}
+              onUsePrompt={handleUseLibraryPrompt}
+            />
+          )}
         </div>
       </div>
     </>
