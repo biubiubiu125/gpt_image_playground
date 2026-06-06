@@ -1,5 +1,5 @@
-const CACHE_NAME = 'gpt-image-playground-v0.1.5'
-const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './pwa-icon.svg']
+const CACHE_NAME = 'gpt-image-playground-static-v0.5.5-cache-1'
+const APP_SHELL = ['./manifest.webmanifest', './pwa-icon.svg']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -25,6 +25,14 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
 
+  const isPromptLibraryRequest = url.pathname.includes('/prompts/')
+  const isServiceWorkerRequest = url.pathname.endsWith('/sw.js')
+
+  if (isServiceWorkerRequest || isPromptLibraryRequest) {
+    event.respondWith(fetch(request))
+    return
+  }
+
   if (request.mode === 'navigate') {
     event.respondWith(
       fetch(request)
@@ -35,6 +43,24 @@ self.addEventListener('fetch', (event) => {
         })
         .catch(() => caches.match('./index.html')),
     )
+    return
+  }
+
+  if (url.pathname.endsWith('/index.html')) {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          const copy = response.clone()
+          caches.open(CACHE_NAME).then((cache) => cache.put('./index.html', copy))
+          return response
+        })
+        .catch(() => caches.match('./index.html')),
+    )
+    return
+  }
+
+  if (!url.pathname.includes('/assets/') && !APP_SHELL.some((path) => url.pathname.endsWith(path.replace('./', '/')))) {
+    event.respondWith(fetch(request))
     return
   }
 

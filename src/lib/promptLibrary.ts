@@ -72,9 +72,10 @@ let cachedPromptLibrary: Promise<PromptLibraryManifest> | null = null
 const cachedChunks = new Map<string, Promise<PromptLibraryFullPrompt[]>>()
 const cachedPrompts = new Map<string, PromptLibraryFullPrompt>()
 
-function getPromptAssetUrl(path: string) {
+function getPromptAssetUrl(path: string, version?: string) {
   const base = import.meta.env.BASE_URL || '/'
-  return `${base.endsWith('/') ? base : `${base}/`}${path.replace(/^\/+/, '')}`
+  const url = `${base.endsWith('/') ? base : `${base}/`}${path.replace(/^\/+/, '')}`
+  return version ? `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(version)}` : url
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -254,6 +255,10 @@ function findPromptChunk(library: PromptLibraryManifest, item: PromptLibraryProm
   return chunk
 }
 
+function getChunkCacheKey(library: PromptLibraryManifest, chunk: PromptLibraryChunkDescriptor) {
+  return `${library.id}:${library.version}:${chunk.id}`
+}
+
 function waitForNextPreloadTurn() {
   return new Promise((resolve) => window.setTimeout(resolve, 80))
 }
@@ -296,19 +301,20 @@ export async function loadPromptLibraryChunk(library: PromptLibraryManifest, chu
   const chunk = library.chunks.find((candidate) => candidate.id === chunkId)
   if (!chunk) throw new Error('提示词分片不存在')
 
-  let promise = cachedChunks.get(chunk.id)
+  const cacheKey = getChunkCacheKey(library, chunk)
+  let promise = cachedChunks.get(cacheKey)
   if (!promise) {
-    promise = fetch(getPromptAssetUrl(chunk.path), PROMPT_CHUNK_FETCH_OPTIONS)
+    promise = fetch(getPromptAssetUrl(chunk.path, library.version), PROMPT_CHUNK_FETCH_OPTIONS)
       .then((response) => {
         if (!response.ok) throw new Error(`提示词分片加载失败：${response.status}`)
         return response.json()
       })
       .then((value) => normalizeChunk(value, chunk))
       .catch((err) => {
-        cachedChunks.delete(chunk.id)
+        cachedChunks.delete(cacheKey)
         throw err
       })
-    cachedChunks.set(chunk.id, promise)
+    cachedChunks.set(cacheKey, promise)
   }
 
   return promise
