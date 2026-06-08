@@ -47,7 +47,7 @@ import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCu
 import { showBrowserNotification } from './lib/browserNotification'
 import { IMAGE_FETCH_CORS_HINT, PARTIAL_IMAGE_FAILURE_PREFIX, type CallApiFinalImage } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
-import { getCustomQueuedImageResult, MAX_CONCURRENT_IMAGE_REQUESTS } from './lib/openaiCompatibleImageApi'
+import { getCustomQueuedImageResult, MAX_CONCURRENT_IMAGE_REQUESTS, shouldSplitImagesApiRequests } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
@@ -4055,7 +4055,11 @@ async function executeTask(taskId: string) {
     : null
 
   if (taskProvider !== 'fal' && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
-    const watchdogTimeout = taskProvider === 'openai' && task.params.n > 1
+    const shouldUseBatchedOpenAITimeout = taskProvider === 'openai' && task.params.n > MAX_CONCURRENT_IMAGE_REQUESTS && (
+      activeProfile.apiMode === 'responses' ||
+      (activeProfile.apiMode === 'images' && shouldSplitImagesApiRequests(activeProfile, task.params.n))
+    )
+    const watchdogTimeout = shouldUseBatchedOpenAITimeout
       ? activeProfile.timeout * Math.ceil(task.params.n / MAX_CONCURRENT_IMAGE_REQUESTS)
       : activeProfile.timeout
     scheduleOpenAIWatchdog(taskId, watchdogTimeout, activeProfile)

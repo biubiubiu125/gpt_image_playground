@@ -240,19 +240,16 @@ describe('callImageApi', () => {
     })
   })
 
-  it('splits Images API streaming into concurrent single-image requests when n is greater than 1', async () => {
+  it('sends Images API multi-image requests once without streaming fields', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
-      const streamBody = [
-        'data: {"type":"image_generation.partial_image","partial_image_index":0,"b64_json":"cGFydGlhbA=="}',
-        '',
-        'data: {"type":"image_generation.completed","b64_json":"ZmluYWw=","size":"1024x1024","quality":"high","output_format":"png"}',
-        '',
-        'data: [DONE]',
-        '',
-      ].join('\n')
-      return new Response(streamBody, {
+      return new Response(JSON.stringify({
+        data: [
+          { b64_json: 'Zmlyc3Q=', revised_prompt: 'first prompt' },
+          { b64_json: 'c2Vjb25k', revised_prompt: 'second prompt' },
+        ],
+      }), {
         status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
+        headers: { 'Content-Type': 'application/json' },
       })
     })
     const partials: Array<{ image: string; requestIndex?: number }> = []
@@ -276,43 +273,77 @@ describe('callImageApi', () => {
       onPartialImage: (partial: { image: string; requestIndex?: number }) => partials.push(partial),
     } as any)
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    for (const [, init] of fetchMock.mock.calls) {
-      const body = JSON.parse(String((init as RequestInit).body))
-      expect(body.n).toBeUndefined()
-      expect(body.stream).toBe(true)
-      expect(body.partial_images).toBe(1)
-    }
-    expect(result.images).toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.n).toBe(2)
+    expect(body.stream).toBeUndefined()
+    expect(body.partial_images).toBeUndefined()
     expect(result.images).toEqual([
-      'data:image/png;base64,ZmluYWw=',
-      'data:image/png;base64,ZmluYWw=',
+      'data:image/png;base64,Zmlyc3Q=',
+      'data:image/png;base64,c2Vjb25k',
     ])
-    expect(partials.map((partial) => partial.requestIndex).sort()).toEqual([0, 1])
-    expect(partials.map((partial) => partial.image)).toEqual([
-      'data:image/png;base64,cGFydGlhbA==',
-      'data:image/png;base64,cGFydGlhbA==',
-    ])
+    expect(result.revisedPrompts).toEqual(['first prompt', 'second prompt'])
+    expect(partials).toEqual([])
   })
 
-  it('splits Images API non-streaming requests and emits final images as each single request completes', async () => {
+  it('keeps splitting Images API requests in Codex CLI mode when n is greater than 1', async () => {
     let callIndex = 0
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
       callIndex += 1
       const body = JSON.parse(String((init as RequestInit).body))
       expect(body.n).toBeUndefined()
       expect(body.stream).toBeUndefined()
+      expect(body.prompt).toBe('Use the following text as the complete prompt. Do not rewrite it:\nprompt')
       return new Response(JSON.stringify({
-        data: [{
-          b64_json: callIndex === 1 ? 'Zmlyc3Q=' : 'c2Vjb25k',
-          revised_prompt: callIndex === 1 ? 'first prompt' : 'second prompt',
-        }],
+        data: [{ b64_json: callIndex === 1 ? 'Zmlyc3Q=' : 'c2Vjb25k' }],
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
     })
-    const finalImages: Array<{ image: string; requestIndex?: number; revisedPrompt?: string }> = []
+
+    const result = await callImageApi({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        codexCli: true,
+        streamImages: false,
+        profiles: DEFAULT_SETTINGS.profiles.map((profile) => ({
+          ...profile,
+          apiKey: 'test-key',
+          codexCli: true,
+          streamImages: false,
+        })),
+      },
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS, n: 2 },
+      inputImageDataUrls: [],
+    } as any)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.images).toEqual([
+      'data:image/png;base64,Zmlyc3Q=',
+      'data:image/png;base64,c2Vjb25k',
+    ])
+    expect(result.requestedImageCount).toBe(2)
+  })
+
+  it('sends Images API non-streaming n greater than 1 as a single request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String((init as RequestInit).body))
+      expect(body.n).toBe(2)
+      expect(body.stream).toBeUndefined()
+      return new Response(JSON.stringify({
+        data: [
+          { b64_json: 'Zmlyc3Q=', revised_prompt: 'first prompt' },
+          { b64_json: 'c2Vjb25k', revised_prompt: 'second prompt' },
+        ],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
 
     const result = await callImageApi({
       settings: {
@@ -328,72 +359,16 @@ describe('callImageApi', () => {
       prompt: 'prompt',
       params: { ...DEFAULT_PARAMS, n: 2 },
       inputImageDataUrls: [],
-      onFinalImage: (image: { image: string; requestIndex?: number; revisedPrompt?: string }) => finalImages.push(image),
     } as any)
 
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(result.images).toEqual([
       'data:image/png;base64,Zmlyc3Q=',
       'data:image/png;base64,c2Vjb25k',
     ])
-    expect(result.requestedImageCount).toBe(2)
+    expect(result.revisedPrompts).toEqual(['first prompt', 'second prompt'])
+    expect(result.requestedImageCount).toBeUndefined()
     expect(result.failedImageCount).toBeUndefined()
-    expect(finalImages.sort((a, b) => (a.requestIndex ?? 0) - (b.requestIndex ?? 0))).toEqual([
-      { image: 'data:image/png;base64,Zmlyc3Q=', revisedPrompt: 'first prompt', requestIndex: 0 },
-      { image: 'data:image/png;base64,c2Vjb25k', revisedPrompt: 'second prompt', requestIndex: 1 },
-    ])
-  })
-
-  it('keeps successful Images API split results when one single-image request fails', async () => {
-    let callIndex = 0
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
-      callIndex += 1
-      if (callIndex === 2) {
-        return new Response(JSON.stringify({ error: { message: 'upstream failed' } }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-
-      return new Response(JSON.stringify({
-        data: [{ b64_json: callIndex === 1 ? 'b25l' : 'dGhyZWU=' }],
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      })
-    })
-    const finalImages: Array<{ image: string; requestIndex?: number }> = []
-
-    const result = await callImageApi({
-      settings: {
-        ...DEFAULT_SETTINGS,
-        apiKey: 'test-key',
-        streamImages: false,
-        profiles: DEFAULT_SETTINGS.profiles.map((profile) => ({
-          ...profile,
-          apiKey: 'test-key',
-          streamImages: false,
-        })),
-      },
-      prompt: 'prompt',
-      params: { ...DEFAULT_PARAMS, n: 3 },
-      inputImageDataUrls: [],
-      onFinalImage: (image: { image: string; requestIndex?: number }) => finalImages.push(image),
-    } as any)
-
-    expect(fetchMock).toHaveBeenCalledTimes(3)
-    expect(result.images).toEqual([
-      'data:image/png;base64,b25l',
-      'data:image/png;base64,dGhyZWU=',
-    ])
-    expect(finalImages.sort((a, b) => (a.requestIndex ?? 0) - (b.requestIndex ?? 0))).toEqual([
-      { image: 'data:image/png;base64,b25l', requestIndex: 0 },
-      { image: 'data:image/png;base64,dGhyZWU=', requestIndex: 2 },
-    ])
-    expect(result.requestedImageCount).toBe(3)
-    expect(result.failedImageCount).toBe(1)
-    expect(result.partialError).toContain('已完成 2/3 张')
-    expect(result.partialError).toContain('upstream failed')
   })
 
   it('streams Responses API partial images and resolves the completed response image', async () => {

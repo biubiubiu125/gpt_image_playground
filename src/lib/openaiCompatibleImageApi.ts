@@ -23,6 +23,10 @@ import {
 const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
 export const MAX_CONCURRENT_IMAGE_REQUESTS = 4
 
+export function shouldSplitImagesApiRequests(profile: Pick<ApiProfile, 'codexCli'>, n: number): boolean {
+  return n > 1 && profile.codexCli === true
+}
+
 function getStreamPartialImages(profile: ApiProfile): number {
   return profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
 }
@@ -530,7 +534,7 @@ function getFirstRejectedMessage(results: Array<PromiseSettledResult<CallApiResu
 
 async function callImagesApi(opts: CallApiOptions, profile: ApiProfile, customProvider?: CustomProviderDefinition | null): Promise<CallApiResult> {
   const n = opts.params.n > 0 ? opts.params.n : 1
-  if (n > 1) {
+  if (shouldSplitImagesApiRequests(profile, n)) {
     return callImagesApiConcurrent(opts, profile, n, customProvider)
   }
 
@@ -601,6 +605,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
     ? `${PROMPT_REWRITE_GUARD_PREFIX}\n${originalPrompt}`
     : originalPrompt
   const isEdit = inputImageDataUrls.length > 0
+  const shouldStream = profile.streamImages === true && (params.n <= 1 || shouldSplitImagesApiRequests(profile, params.n))
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -634,7 +639,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
       if (profile.responseFormatB64Json) {
         formData.append('response_format', 'b64_json')
       }
-      if (profile.streamImages) {
+      if (shouldStream) {
         formData.append('stream', 'true')
         formData.append('partial_images', String(getStreamPartialImages(profile)))
       }
@@ -696,7 +701,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
       if (profile.responseFormatB64Json) {
         body.response_format = 'b64_json'
       }
-      if (profile.streamImages) {
+      if (shouldStream) {
         body.stream = true
         body.partial_images = getStreamPartialImages(profile)
       }
@@ -717,7 +722,7 @@ async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, cu
       throw new Error(await getApiErrorMessage(response))
     }
 
-    if (profile.streamImages && isEventStreamResponse(response)) {
+    if (shouldStream && isEventStreamResponse(response)) {
       return parseImagesApiStreamResponse(response, mime, opts.onPartialImage)
     }
 

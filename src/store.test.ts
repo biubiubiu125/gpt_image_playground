@@ -107,6 +107,7 @@ import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFav
 
 afterEach(() => {
   dbMockState.putTaskImpl = undefined
+  vi.useRealTimers()
 })
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
@@ -416,6 +417,91 @@ describe('OpenAI split image task completion', () => {
     expect(persistedTask?.outputImages).toEqual(completedTask.outputImages)
     const storedImages = await Promise.all(completedTask.outputImages.map((id) => getImage(id)))
     expect(storedImages.map((img) => img?.dataUrl)).toEqual([secondImage, firstImage])
+  })
+
+  it('stores multi-image results returned by one non-streaming Images API request', async () => {
+    const firstImage = 'data:image/png;base64,first'
+    const secondImage = 'data:image/png;base64,second'
+
+    vi.mocked(callImageApi).mockResolvedValue({
+      images: [firstImage, secondImage],
+      actualParams: { n: 2 },
+      actualParamsList: [{ size: '1536x1024' }, { size: '1024x1024' }],
+      revisedPrompts: ['first prompt', 'second prompt'],
+      rawImageUrls: ['https://example.test/first.png', 'https://example.test/second.png'],
+    })
+
+    await submitTask()
+    await waitForStore(() => useStore.getState().tasks[0]?.status === 'done')
+
+    const completedTask = useStore.getState().tasks[0]
+    expect(completedTask.outputImages).toHaveLength(2)
+    expect(completedTask.rawImageUrls).toEqual(['https://example.test/first.png', 'https://example.test/second.png'])
+    expect(completedTask.actualParams).toMatchObject({ n: 2 })
+    expect(completedTask.actualParamsByImage?.[completedTask.outputImages[0]]).toMatchObject({ size: '1536x1024' })
+    expect(completedTask.actualParamsByImage?.[completedTask.outputImages[1]]).toMatchObject({ size: '1024x1024' })
+    expect(completedTask.revisedPromptByImage?.[completedTask.outputImages[0]]).toBe('first prompt')
+    expect(completedTask.revisedPromptByImage?.[completedTask.outputImages[1]]).toBe('second prompt')
+
+    const persistedTask = (await getAllTasks()).find((item) => item.id === completedTask.id)
+    expect(persistedTask?.status).toBe('done')
+    expect(persistedTask?.outputImages).toEqual(completedTask.outputImages)
+    const storedImages = await Promise.all(completedTask.outputImages.map((id) => getImage(id)))
+    expect(storedImages.map((img) => img?.dataUrl)).toEqual([firstImage, secondImage])
+  })
+
+  it('keeps batched Responses API tasks running past one request timeout', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-09T00:00:00Z'))
+    const responsesProfile = createDefaultOpenAIProfile({
+      id: 'responses-watchdog-profile',
+      apiKey: 'test-key',
+      apiMode: 'responses',
+      timeout: 1,
+    })
+    let resolveApi!: (result: Awaited<ReturnType<typeof callImageApi>>) => void
+
+    vi.mocked(callImageApi).mockImplementation(() => new Promise((resolve) => {
+      resolveApi = resolve
+    }))
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+      }),
+      appMode: 'gallery',
+      prompt: 'prompt',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS, n: 5 },
+      tasks: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
+      showSettings: false,
+      toast: null,
+      confirmDialog: null,
+      showToast: vi.fn(),
+      setConfirmDialog: vi.fn(),
+    })
+
+    await submitTask()
+    await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(useStore.getState().tasks[0]?.status).toBe('running')
+
+    resolveApi({
+      images: ['data:image/png;base64,done'],
+      actualParams: { n: 1 },
+      actualParamsList: [{ n: 1 }],
+      revisedPrompts: [],
+    })
+    for (let i = 0; i < 20 && useStore.getState().tasks[0]?.status !== 'done'; i++) {
+      await Promise.resolve()
+    }
+
+    expect(useStore.getState().tasks[0]?.status).toBe('done')
   })
 
   it('does not resurrect a deleted task behind queued image progress writes', async () => {
