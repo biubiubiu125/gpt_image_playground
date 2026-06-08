@@ -295,6 +295,107 @@ describe('callImageApi', () => {
     ])
   })
 
+  it('splits Images API non-streaming requests and emits final images as each single request completes', async () => {
+    let callIndex = 0
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      callIndex += 1
+      const body = JSON.parse(String((init as RequestInit).body))
+      expect(body.n).toBeUndefined()
+      expect(body.stream).toBeUndefined()
+      return new Response(JSON.stringify({
+        data: [{
+          b64_json: callIndex === 1 ? 'Zmlyc3Q=' : 'c2Vjb25k',
+          revised_prompt: callIndex === 1 ? 'first prompt' : 'second prompt',
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    const finalImages: Array<{ image: string; requestIndex?: number; revisedPrompt?: string }> = []
+
+    const result = await callImageApi({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        streamImages: false,
+        profiles: DEFAULT_SETTINGS.profiles.map((profile) => ({
+          ...profile,
+          apiKey: 'test-key',
+          streamImages: false,
+        })),
+      },
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS, n: 2 },
+      inputImageDataUrls: [],
+      onFinalImage: (image: { image: string; requestIndex?: number; revisedPrompt?: string }) => finalImages.push(image),
+    } as any)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(result.images).toEqual([
+      'data:image/png;base64,Zmlyc3Q=',
+      'data:image/png;base64,c2Vjb25k',
+    ])
+    expect(result.requestedImageCount).toBe(2)
+    expect(result.failedImageCount).toBeUndefined()
+    expect(finalImages.sort((a, b) => (a.requestIndex ?? 0) - (b.requestIndex ?? 0))).toEqual([
+      { image: 'data:image/png;base64,Zmlyc3Q=', revisedPrompt: 'first prompt', requestIndex: 0 },
+      { image: 'data:image/png;base64,c2Vjb25k', revisedPrompt: 'second prompt', requestIndex: 1 },
+    ])
+  })
+
+  it('keeps successful Images API split results when one single-image request fails', async () => {
+    let callIndex = 0
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      callIndex += 1
+      if (callIndex === 2) {
+        return new Response(JSON.stringify({ error: { message: 'upstream failed' } }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      return new Response(JSON.stringify({
+        data: [{ b64_json: callIndex === 1 ? 'b25l' : 'dGhyZWU=' }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    const finalImages: Array<{ image: string; requestIndex?: number }> = []
+
+    const result = await callImageApi({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        streamImages: false,
+        profiles: DEFAULT_SETTINGS.profiles.map((profile) => ({
+          ...profile,
+          apiKey: 'test-key',
+          streamImages: false,
+        })),
+      },
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS, n: 3 },
+      inputImageDataUrls: [],
+      onFinalImage: (image: { image: string; requestIndex?: number }) => finalImages.push(image),
+    } as any)
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(result.images).toEqual([
+      'data:image/png;base64,b25l',
+      'data:image/png;base64,dGhyZWU=',
+    ])
+    expect(finalImages.sort((a, b) => (a.requestIndex ?? 0) - (b.requestIndex ?? 0))).toEqual([
+      { image: 'data:image/png;base64,b25l', requestIndex: 0 },
+      { image: 'data:image/png;base64,dGhyZWU=', requestIndex: 2 },
+    ])
+    expect(result.requestedImageCount).toBe(3)
+    expect(result.failedImageCount).toBe(1)
+    expect(result.partialError).toContain('已完成 2/3 张')
+    expect(result.partialError).toContain('upstream failed')
+  })
+
   it('streams Responses API partial images and resolves the completed response image', async () => {
     const streamBody = [
       'data: {"type":"response.image_generation_call.partial_image","partial_image_index":0,"partial_image_b64":"cGFydGlhbA=="}',

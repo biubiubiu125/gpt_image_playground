@@ -11,6 +11,7 @@ import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { downloadImageEntriesAsZip, downloadImageIds, getImageZipEntries } from '../lib/downloadImages'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
 import { replaceImageMentionsForApi } from '../lib/promptImageMentions'
+import { isPartialImageFailureError } from '../lib/imageApiShared'
 import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashIcon } from './icons'
 
 import ViewportTooltip from './ViewportTooltip'
@@ -88,9 +89,12 @@ export default function DetailModal() {
   }, [activeStreamPreviewSrc, detailTaskId, imageIndex])
 
   useEffect(() => {
-    const count = task?.status === 'running'
+    const outputCount = task?.outputImages?.length ?? 0
+    const count = outputCount > 0
+      ? outputCount
+      : task?.status === 'running'
       ? streamPreviewItems.length
-      : task?.outputImages?.length ?? 0
+      : outputCount
     if (count > 0 && imageIndex >= count) setImageIndex(count - 1)
   }, [imageIndex, streamPreviewItems.length, task?.outputImages?.length, task?.status])
 
@@ -205,6 +209,11 @@ export default function DetailModal() {
   const showReferenceSection = allInputImageIds.length > 0 || isAgentEditTool
 
   const outputLen = task.outputImages?.length || 0
+  const hasCompletedOutput = outputLen > 0
+  const requestedOutputCount = Math.max(task.params.n || 1, outputLen)
+  const isPartialFailure = task.status === 'error' && hasCompletedOutput && isPartialImageFailureError(task.error)
+  const isCompletedOutputError = task.status === 'error' && hasCompletedOutput
+  const completedOutputErrorTitle = isPartialFailure ? '部分完成' : '生成失败'
   const currentImageRatio = currentOutputImageId ? imageRatios[currentOutputImageId] : ''
   const currentImageSize = currentOutputImageId ? imageSizes[currentOutputImageId] : ''
   const currentActualParams = currentOutputImageId ? task.actualParamsByImage?.[currentOutputImageId] : undefined
@@ -407,7 +416,7 @@ export default function DetailModal() {
 
         {/* 左侧：图片 */}
         <div className="md:w-1/2 w-full h-64 md:h-auto bg-gray-100 dark:bg-black/20 relative flex items-center justify-center flex-shrink-0 min-h-[16rem]">
-          {task.status === 'done' && outputLen > 0 && (
+          {hasCompletedOutput && (
             <div className="absolute right-3 top-[15px] z-20 flex items-center gap-1.5">
               <div className="relative group flex">
                 <button
@@ -448,7 +457,7 @@ export default function DetailModal() {
               )}
             </div>
           )}
-          {task.status === 'done' && outputLen > 0 && currentOutputPreviewSrc && (
+          {hasCompletedOutput && currentOutputPreviewSrc && (
             <>
               <img
                 src={currentOutputPreviewSrc}
@@ -493,6 +502,16 @@ export default function DetailModal() {
                   )
                 )}
               </div>
+              {isCompletedOutputError && (
+                <span className="absolute right-4 top-12 rounded bg-red-500 px-2 py-0.5 text-xs font-medium text-white backdrop-blur-sm">
+                  {completedOutputErrorTitle}
+                </span>
+              )}
+              {task.status === 'running' && outputLen < requestedOutputCount && (
+                <span className="absolute bottom-2 right-4 rounded-full bg-black/50 px-2 py-0.5 text-xs text-white backdrop-blur-sm">
+                  已完成 {outputLen}/{requestedOutputCount}
+                </span>
+              )}
               {outputLen > 1 && (
                 <>
                   <button
@@ -524,7 +543,7 @@ export default function DetailModal() {
               )}
             </>
           )}
-          {(task.status === 'running' || isFalReconnecting) && (
+          {!hasCompletedOutput && (task.status === 'running' || isFalReconnecting) && (
             <>
               <div className="absolute left-4 top-4 flex items-center gap-1 bg-black/50 text-white text-xs px-2 py-0.5 rounded backdrop-blur-sm font-mono">
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -587,7 +606,7 @@ export default function DetailModal() {
               )}
             </>
           )}
-          {task.status === 'error' && isFalReconnecting && (
+          {task.status === 'error' && !hasCompletedOutput && isFalReconnecting && (
             <div className="w-full max-w-md px-4 text-center">
               <svg className="w-10 h-10 text-yellow-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
@@ -595,7 +614,7 @@ export default function DetailModal() {
               <p className="text-sm font-medium text-yellow-500">重连中</p>
             </div>
           )}
-          {task.status === 'error' && !isFalReconnecting && (
+          {task.status === 'error' && !hasCompletedOutput && !isFalReconnecting && (
             <div className="w-full max-w-md px-4 text-center">
               <svg className="w-10 h-10 text-red-400 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -774,6 +793,12 @@ export default function DetailModal() {
                   value={currentRevisedPrompt}
                   className="max-w-full rounded px-2 py-1 text-left text-xs leading-relaxed whitespace-pre-wrap"
                 />
+              </div>
+            )}
+            {isCompletedOutputError && task.error && (
+              <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-600 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300">
+                <div className="mb-1 font-medium">{completedOutputErrorTitle}</div>
+                <p className="whitespace-pre-line break-words">{task.error}</p>
               </div>
             )}
 

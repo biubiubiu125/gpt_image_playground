@@ -8,6 +8,7 @@ export const MIME_MAP: Record<string, string> = {
 
 export const MAX_MASK_EDIT_FILE_BYTES = 50 * 1024 * 1024
 export const MAX_IMAGE_INPUT_PAYLOAD_BYTES = 512 * 1024 * 1024
+export const PARTIAL_IMAGE_FAILURE_PREFIX = '部分请求失败：已完成'
 
 export interface CallApiOptions {
   settings: AppSettings
@@ -19,6 +20,15 @@ export interface CallApiOptions {
   onFalRequestEnqueued?: (request: { requestId: string; endpoint: string }) => void
   onCustomTaskEnqueued?: (task: { taskId: string }) => void
   onPartialImage?: (partial: { image: string; partialImageIndex?: number; requestIndex?: number }) => void
+  onFinalImage?: (image: CallApiFinalImage) => void | Promise<void>
+}
+
+export interface CallApiFinalImage {
+  image: string
+  actualParams?: Partial<TaskParams>
+  revisedPrompt?: string
+  rawImageUrl?: string
+  requestIndex?: number
 }
 
 export interface CallApiResult {
@@ -32,6 +42,9 @@ export interface CallApiResult {
   revisedPrompts?: Array<string | undefined>
   /** API 返回的原始图片 HTTP URL（非 base64 时记录） */
   rawImageUrls?: string[]
+  requestedImageCount?: number
+  failedImageCount?: number
+  partialError?: string
 }
 
 export function isHttpUrl(value: unknown): value is string {
@@ -40,6 +53,10 @@ export function isHttpUrl(value: unknown): value is string {
 
 export function isDataUrl(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith('data:')
+}
+
+export function isPartialImageFailureError(error: string | null | undefined): boolean {
+  return typeof error === 'string' && error.startsWith(PARTIAL_IMAGE_FAILURE_PREFIX)
 }
 
 export function normalizeBase64Image(value: string, fallbackMime: string): string {

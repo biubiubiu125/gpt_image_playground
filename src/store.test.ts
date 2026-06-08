@@ -1,68 +1,73 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, RK_API_PROFILE_NAME, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
-vi.mock('./lib/db', () => {
-  const tasks = new Map<string, TaskRecord>()
-  const images = new Map<string, StoredImage>()
-  const thumbnails = new Map<string, StoredImageThumbnail>()
-  const agentConversations = new Map<string, AgentConversation>()
-  let imageSeq = 0
 
+const dbMockState = vi.hoisted(() => ({
+  tasks: new Map<string, any>(),
+  images: new Map<string, any>(),
+  thumbnails: new Map<string, any>(),
+  agentConversations: new Map<string, any>(),
+  imageSeq: 0,
+  putTaskImpl: undefined as undefined | ((task: any) => Promise<any>),
+}))
+
+vi.mock('./lib/db', () => {
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
-    getAllTasks: async () => [...tasks.values()],
+    getAllTasks: async () => [...dbMockState.tasks.values()],
     putTask: async (task: TaskRecord) => {
-      tasks.set(task.id, task)
+      if (dbMockState.putTaskImpl) return dbMockState.putTaskImpl(task)
+      dbMockState.tasks.set(task.id, task)
       return task.id
     },
     deleteTask: async (id: string) => {
-      tasks.delete(id)
+      dbMockState.tasks.delete(id)
     },
     clearTasks: async () => {
-      tasks.clear()
+      dbMockState.tasks.clear()
     },
-    getAllAgentConversations: async () => [...agentConversations.values()],
+    getAllAgentConversations: async () => [...dbMockState.agentConversations.values()],
     putAgentConversation: async (conversation: AgentConversation) => {
-      agentConversations.set(conversation.id, conversation)
+      dbMockState.agentConversations.set(conversation.id, conversation)
       return conversation.id
     },
     deleteAgentConversation: async (id: string) => {
-      agentConversations.delete(id)
+      dbMockState.agentConversations.delete(id)
     },
     clearAgentConversations: async () => {
-      agentConversations.clear()
+      dbMockState.agentConversations.clear()
     },
     replaceAgentConversations: async (conversations: AgentConversation[]) => {
-      agentConversations.clear()
-      for (const conversation of conversations) agentConversations.set(conversation.id, conversation)
+      dbMockState.agentConversations.clear()
+      for (const conversation of conversations) dbMockState.agentConversations.set(conversation.id, conversation)
     },
-    getImage: async (id: string) => images.get(id),
-    getImageThumbnail: async (id: string) => thumbnails.get(id),
-    getStoredFreshImageThumbnail: async (id: string) => thumbnails.get(id),
-    getAllImageIds: async () => [...images.keys()],
-    getAllImages: async () => [...images.values()],
+    getImage: async (id: string) => dbMockState.images.get(id),
+    getImageThumbnail: async (id: string) => dbMockState.thumbnails.get(id),
+    getStoredFreshImageThumbnail: async (id: string) => dbMockState.thumbnails.get(id),
+    getAllImageIds: async () => [...dbMockState.images.keys()],
+    getAllImages: async () => [...dbMockState.images.values()],
     putImage: async (image: StoredImage) => {
-      images.set(image.id, image)
+      dbMockState.images.set(image.id, image)
       return image.id
     },
     putImageThumbnail: async (thumbnail: StoredImageThumbnail) => {
-      thumbnails.set(thumbnail.id, thumbnail)
+      dbMockState.thumbnails.set(thumbnail.id, thumbnail)
       return thumbnail.id
     },
     deleteImage: async (id: string) => {
-      images.delete(id)
-      thumbnails.delete(id)
+      dbMockState.images.delete(id)
+      dbMockState.thumbnails.delete(id)
     },
     clearImages: async () => {
-      images.clear()
-      thumbnails.clear()
+      dbMockState.images.clear()
+      dbMockState.thumbnails.clear()
     },
     storeImage: async (dataUrl: string, source: StoredImage['source'] = 'upload') => {
-      const id = `stored-image-${++imageSeq}`
-      images.set(id, { id, dataUrl, source, createdAt: Date.now() })
+      const id = `stored-image-${++dbMockState.imageSeq}`
+      dbMockState.images.set(id, { id, dataUrl, source, createdAt: Date.now() })
       return id
     },
   }
@@ -95,9 +100,14 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
+import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, getImage, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
+import { callImageApi } from './lib/api'
 import { cleanStaleAgentInputDrafts, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, submitAgentMessage, submitTask, useStore } from './store'
+
+afterEach(() => {
+  dbMockState.putTaskImpl = undefined
+})
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
@@ -141,6 +151,18 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
     elapsed: 1,
     ...overrides,
   }
+}
+
+async function waitForStore(predicate: () => boolean, maxTicks = 20) {
+  for (let i = 0; i < maxTicks; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  throw new Error('Timed out waiting for store state')
+}
+
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 function importFile(data: ExportData): File {
@@ -306,6 +328,138 @@ describe('interrupted OpenAI running tasks', () => {
     expect(result.tasks.find((item) => item.id === 'fal-running')).toEqual(falRunning)
     expect(result.tasks.find((item) => item.id === 'custom-running')).toEqual(customAsyncRunning)
     expect(result.tasks.find((item) => item.id === 'done-task')).toEqual(doneTask)
+  })
+})
+
+describe('OpenAI split image task completion', () => {
+  const openaiProfile = createDefaultOpenAIProfile({
+    id: 'openai-profile',
+    apiKey: 'test-key',
+    streamImages: false,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    dbMockState.putTaskImpl = undefined
+    vi.mocked(callImageApi).mockReset()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [openaiProfile],
+        activeProfileId: openaiProfile.id,
+      }),
+      appMode: 'gallery',
+      prompt: 'prompt',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS, n: 3 },
+      tasks: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
+      showSettings: false,
+      toast: null,
+      confirmDialog: null,
+      showToast: vi.fn(),
+      setConfirmDialog: vi.fn(),
+    })
+  })
+
+  it('keeps progressively appended images when split requests partially fail', async () => {
+    const secondImage = 'data:image/png;base64,second'
+    const firstImage = 'data:image/png;base64,first'
+
+    vi.mocked(callImageApi).mockImplementation(async (opts) => {
+      await opts.onFinalImage?.({
+        image: secondImage,
+        actualParams: { size: '1024x1024' },
+        revisedPrompt: 'second prompt',
+        rawImageUrl: 'https://example.test/second.png',
+        requestIndex: 1,
+      })
+      await opts.onFinalImage?.({
+        image: firstImage,
+        actualParams: { size: '1536x1024' },
+        revisedPrompt: 'first prompt',
+        rawImageUrl: 'https://example.test/first.png',
+        requestIndex: 0,
+      })
+
+      return {
+        images: [firstImage, secondImage],
+        actualParams: { n: 2 },
+        actualParamsList: [{ size: '1536x1024' }, { size: '1024x1024' }],
+        revisedPrompts: ['first prompt', 'second prompt'],
+        rawImageUrls: ['https://example.test/first.png', 'https://example.test/second.png'],
+        requestedImageCount: 3,
+        failedImageCount: 1,
+        partialError: '部分请求失败：已完成 2/3 张。upstream failed',
+      }
+    })
+
+    await submitTask()
+    await waitForStore(() => useStore.getState().tasks[0]?.status === 'error')
+
+    const completedTask = useStore.getState().tasks[0]
+    expect(completedTask.status).toBe('error')
+    expect(completedTask.error).toContain('部分请求失败：已完成 2/3 张')
+    expect(completedTask.outputImages).toHaveLength(2)
+    expect(completedTask.rawImageUrls).toEqual(['https://example.test/second.png', 'https://example.test/first.png'])
+    expect(completedTask.actualParams).toMatchObject({ n: 2 })
+    expect(completedTask.actualParamsByImage?.[completedTask.outputImages[0]]).toMatchObject({ size: '1024x1024' })
+    expect(completedTask.actualParamsByImage?.[completedTask.outputImages[1]]).toMatchObject({ size: '1536x1024' })
+    expect(completedTask.revisedPromptByImage?.[completedTask.outputImages[0]]).toBe('second prompt')
+    expect(completedTask.revisedPromptByImage?.[completedTask.outputImages[1]]).toBe('first prompt')
+
+    const persistedTask = (await getAllTasks()).find((item) => item.id === completedTask.id)
+    expect(persistedTask?.status).toBe('error')
+    expect(persistedTask?.outputImages).toEqual(completedTask.outputImages)
+    const storedImages = await Promise.all(completedTask.outputImages.map((id) => getImage(id)))
+    expect(storedImages.map((img) => img?.dataUrl)).toEqual([secondImage, firstImage])
+  })
+
+  it('does not resurrect a deleted task behind queued image progress writes', async () => {
+    const firstImage = 'data:image/png;base64,first'
+    const releaseQueuedPut: Array<() => void> = []
+    dbMockState.putTaskImpl = async (taskToPersist: TaskRecord) => {
+      if (taskToPersist.outputImages.length > 0) {
+        await new Promise<void>((resolve) => releaseQueuedPut.push(resolve))
+      }
+      dbMockState.tasks.set(taskToPersist.id, taskToPersist)
+      return taskToPersist.id
+    }
+
+    let resolveApi!: () => void
+    vi.mocked(callImageApi).mockImplementation(async (opts) => {
+      await opts.onFinalImage?.({
+        image: firstImage,
+        actualParams: { size: '1024x1024' },
+        requestIndex: 0,
+      })
+      await new Promise<void>((resolve) => {
+        resolveApi = resolve
+      })
+      return {
+        images: [firstImage],
+        actualParams: { n: 1 },
+        actualParamsList: [{ size: '1024x1024' }],
+        revisedPrompts: [],
+      }
+    })
+
+    await submitTask()
+    await waitForStore(() => useStore.getState().tasks[0]?.outputImages.length === 1)
+    const taskToDelete = useStore.getState().tasks[0]
+    const deletePromise = removeTask(taskToDelete)
+    await nextTick()
+    expect(await getAllTasks()).toHaveLength(1)
+
+    releaseQueuedPut.forEach((release) => release())
+    await deletePromise
+    resolveApi()
+    await waitForStore(() => useStore.getState().tasks.length === 0)
+
+    expect(await getAllTasks()).toHaveLength(0)
   })
 })
 
@@ -1770,7 +1924,7 @@ describe('reused task API profile', () => {
     expect(state.settings.activeProfileId).toBe(openaiProfile.id)
     expect(state.reusedTaskApiProfileId).toBe(falProfile.id)
     expect(state.params).toMatchObject({ n: 4, size: '1360x1024', quality: 'high' })
-    expect(state.showToast).toHaveBeenCalledWith('已临时复用该任务的 API 配置「fal 配置」', 'success')
+    expect(state.showToast).toHaveBeenCalledWith(`已临时复用该任务的 API 配置「${RK_API_PROFILE_NAME}」`, 'success')
   })
 
   it('keeps selected image mentions when reusing a task with different current input images', async () => {

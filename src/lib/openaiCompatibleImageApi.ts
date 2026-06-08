@@ -4,6 +4,7 @@ import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devP
 import {
   assertImageInputPayloadSize,
   assertMaskEditFileSize,
+  type CallApiFinalImage,
   type CallApiOptions,
   type CallApiResult,
   fetchImageUrlAsDataUrl,
@@ -15,10 +16,12 @@ import {
   mergeActualParams,
   MIME_MAP,
   normalizeBase64Image,
+  PARTIAL_IMAGE_FAILURE_PREFIX,
   pickActualParams,
 } from './imageApiShared'
 
 const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
+export const MAX_CONCURRENT_IMAGE_REQUESTS = 4
 
 function getStreamPartialImages(profile: ApiProfile): number {
   return profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
@@ -478,9 +481,56 @@ export async function callOpenAICompatibleImageApi(opts: CallApiOptions, profile
     : callImagesApi(opts, profile)
 }
 
+async function notifyFinalImages(opts: CallApiOptions, result: CallApiResult, requestIndex?: number): Promise<void> {
+  if (!opts.onFinalImage) return
+
+  for (let index = 0; index < result.images.length; index++) {
+    const image: CallApiFinalImage = {
+      image: result.images[index],
+      actualParams: result.actualParamsList?.[index] ?? result.actualParams,
+      revisedPrompt: result.revisedPrompts?.[index],
+      rawImageUrl: result.rawImageUrls?.[index],
+      requestIndex,
+    }
+    try {
+      await opts.onFinalImage(image)
+    } catch {
+      // Final result persistence still runs after the API call resolves.
+    }
+  }
+}
+
+async function settleImageRequests(
+  count: number,
+  worker: (requestIndex: number) => Promise<CallApiResult>,
+): Promise<Array<PromiseSettledResult<CallApiResult>>> {
+  const results = new Array<PromiseSettledResult<CallApiResult>>(count)
+  let nextIndex = 0
+  const workerCount = Math.min(count, MAX_CONCURRENT_IMAGE_REQUESTS)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < count) {
+      const requestIndex = nextIndex++
+      try {
+        results[requestIndex] = { status: 'fulfilled', value: await worker(requestIndex) }
+      } catch (reason) {
+        results[requestIndex] = { status: 'rejected', reason }
+      }
+    }
+  }))
+
+  return results
+}
+
+function getFirstRejectedMessage(results: Array<PromiseSettledResult<CallApiResult>>): string {
+  const firstError = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+  if (!firstError) return ''
+  return firstError.reason instanceof Error ? firstError.reason.message : String(firstError.reason)
+}
+
 async function callImagesApi(opts: CallApiOptions, profile: ApiProfile, customProvider?: CustomProviderDefinition | null): Promise<CallApiResult> {
   const n = opts.params.n > 0 ? opts.params.n : 1
-  if ((profile.codexCli || (profile.streamImages && n > 1)) && n > 1) {
+  if (n > 1) {
     return callImagesApiConcurrent(opts, profile, n, customProvider)
   }
 
@@ -496,14 +546,16 @@ async function callImagesApiConcurrent(opts: CallApiOptions, profile: ApiProfile
       ...(profile.codexCli ? { quality: 'auto' as const } : {}),
     },
   }
-  const results = await Promise.allSettled(
-    Array.from({ length: n }).map((_, requestIndex) => callImagesApiSingle({
+  const results = await settleImageRequests(n, async (requestIndex) => {
+    const result = await callImagesApiSingle({
       ...singleOpts,
       onPartialImage: opts.onPartialImage
         ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
         : undefined,
-    }, profile, customProvider)),
-  )
+    }, profile, customProvider)
+    await notifyFinalImages(opts, result, requestIndex)
+    return result
+  })
 
   const successfulResults = results
     .filter((r): r is PromiseFulfilledResult<CallApiResult> => r.status === 'fulfilled')
@@ -527,8 +579,20 @@ async function callImagesApiConcurrent(opts: CallApiOptions, profile: ApiProfile
     successfulResults[0]?.actualParams ?? {},
     { n: images.length },
   )
+  const failedImageCount = results.filter((r) => r.status === 'rejected').length
+  const partialError = failedImageCount > 0
+    ? `${PARTIAL_IMAGE_FAILURE_PREFIX} ${images.length}/${n} 张。${getFirstRejectedMessage(results)}`
+    : undefined
 
-  return { images, actualParams, actualParamsList, revisedPrompts, ...(rawImageUrls.length ? { rawImageUrls } : {}) }
+  return {
+    images,
+    actualParams,
+    actualParamsList,
+    revisedPrompts,
+    ...(rawImageUrls.length ? { rawImageUrls } : {}),
+    requestedImageCount: n,
+    ...(failedImageCount > 0 ? { failedImageCount, partialError } : {}),
+  }
 }
 
 async function callImagesApiSingle(opts: CallApiOptions, profile: ApiProfile, customProvider?: CustomProviderDefinition | null): Promise<CallApiResult> {
@@ -971,13 +1035,16 @@ async function callResponsesImageApi(opts: CallApiOptions, profile: ApiProfile):
     return callResponsesImageApiSingle(opts, profile)
   }
 
-  const promises = Array.from({ length: n }).map((_, requestIndex) => callResponsesImageApiSingle({
-    ...opts,
-    onPartialImage: opts.onPartialImage
-      ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
-      : undefined,
-  }, profile))
-  const results = await Promise.allSettled(promises)
+  const results = await settleImageRequests(n, async (requestIndex) => {
+    const result = await callResponsesImageApiSingle({
+      ...opts,
+      onPartialImage: opts.onPartialImage
+        ? (partial) => opts.onPartialImage?.({ ...partial, requestIndex })
+        : undefined,
+    }, profile)
+    await notifyFinalImages(opts, result, requestIndex)
+    return result
+  })
   
   const successfulResults = results
     .filter((r): r is PromiseFulfilledResult<CallApiResult> => r.status === 'fulfilled')
@@ -1001,8 +1068,20 @@ async function callResponsesImageApi(opts: CallApiOptions, profile: ApiProfile):
     successfulResults[0]?.actualParams ?? {},
     images.length === opts.params.n ? { n: opts.params.n } : { n: images.length },
   )
+  const failedImageCount = results.filter((r) => r.status === 'rejected').length
+  const partialError = failedImageCount > 0
+    ? `${PARTIAL_IMAGE_FAILURE_PREFIX} ${images.length}/${n} 张。${getFirstRejectedMessage(results)}`
+    : undefined
 
-  return { images, actualParams, actualParamsList, revisedPrompts, ...(rawImageUrls.length ? { rawImageUrls } : {}) }
+  return {
+    images,
+    actualParams,
+    actualParamsList,
+    revisedPrompts,
+    ...(rawImageUrls.length ? { rawImageUrls } : {}),
+    requestedImageCount: n,
+    ...(failedImageCount > 0 ? { failedImageCount, partialError } : {}),
+  }
 }
 
 async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiProfile): Promise<CallApiResult> {

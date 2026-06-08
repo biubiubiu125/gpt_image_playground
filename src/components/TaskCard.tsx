@@ -5,6 +5,7 @@ import { formatImageRatio } from '../lib/size'
 import { getParamDisplay, ActualValueBadge } from '../lib/paramDisplay'
 import { DEFAULT_IMAGES_MODEL, DEFAULT_FAL_MODEL } from '../lib/apiProfiles'
 import { isAgentTaskPromptPending } from '../lib/taskPromptDisplay'
+import { isPartialImageFailureError } from '../lib/imageApiShared'
 import { CodeIcon } from './icons'
 import ViewportTooltip from './ViewportTooltip'
 
@@ -316,6 +317,17 @@ export default function TaskCard({
   const isAgentTask = task.sourceMode === 'agent' || Boolean(task.agentConversationId || task.agentRoundId)
   const showPendingPrompt = isAgentTaskPromptPending(task)
   const showN = !isAgentTask && (task.params.n > 1 || nDisplay.isMismatch)
+  const outputLen = task.outputImages?.length ?? 0
+  const hasCompletedOutput = outputLen > 0
+  const requestedOutputCount = Math.max(task.params.n || 1, outputLen)
+  const isPartialFailure = task.status === 'error' && hasCompletedOutput && isPartialImageFailureError(task.error)
+  const isCompletedOutputError = task.status === 'error' && hasCompletedOutput
+  const completedOutputErrorSummary = isCompletedOutputError && task.error ? task.error.split(/\r?\n/)[0] : ''
+  const outputCountLabel = requestedOutputCount > 1 && (task.status === 'running' || isPartialFailure || outputLen < requestedOutputCount)
+    ? `${outputLen}/${requestedOutputCount}`
+    : outputLen > 1
+    ? String(outputLen)
+    : ''
 
   const defaultModelForProvider = task.apiProvider === 'fal' ? DEFAULT_FAL_MODEL : DEFAULT_IMAGES_MODEL
   const showModel = task.apiModel && task.apiModel !== defaultModelForProvider
@@ -365,9 +377,9 @@ export default function TaskCard({
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
         onTouchCancel={handleTouchCancel}
-        draggable={task.status === 'done' && task.outputImages?.length > 0}
+        draggable={hasCompletedOutput}
         onDragStart={(e) => {
-          if (task.status !== 'done' || !task.outputImages?.length) return;
+          if (!hasCompletedOutput) return;
           const imageIds = task.outputImages;
           e.dataTransfer.setData('text/plain', `agent-images:${imageIds.join(',')}`);
           e.dataTransfer.effectAllowed = 'copy';
@@ -396,7 +408,7 @@ export default function TaskCard({
       <div className="flex h-40">
         {/* 左侧图片区域 */}
         <div className="w-40 min-w-[10rem] h-full bg-gray-100 dark:bg-black/20 relative flex items-center justify-center overflow-hidden flex-shrink-0">
-          {task.status === 'running' && streamPreviewSrc && (
+          {task.status === 'running' && !hasCompletedOutput && streamPreviewSrc && (
             <>
               <img
                 src={streamPreviewSrc}
@@ -412,7 +424,7 @@ export default function TaskCard({
               )}
             </>
           )}
-          {task.status === 'running' && (!streamPreviewSrc || !streamPreviewLoaded) && (
+          {task.status === 'running' && !hasCompletedOutput && (!streamPreviewSrc || !streamPreviewLoaded) && (
             <div className="flex flex-col items-center gap-2">
               <svg
                 className="w-8 h-8 text-blue-400 animate-spin"
@@ -436,7 +448,12 @@ export default function TaskCard({
               <span className="text-xs text-gray-400 dark:text-gray-500">生成中...</span>
             </div>
           )}
-          {task.status === 'error' && isFalReconnecting && (
+          {task.status === 'running' && !hasCompletedOutput && requestedOutputCount > 1 && (
+            <span className="absolute bottom-1 right-1 bg-black/60 text-white text-xs px-1.5 py-0.5 rounded">
+              0/{requestedOutputCount}
+            </span>
+          )}
+          {task.status === 'error' && !hasCompletedOutput && isFalReconnecting && (
             <div className="flex flex-col items-center gap-1 px-2">
               <svg
                 className="w-7 h-7 text-yellow-400"
@@ -456,7 +473,7 @@ export default function TaskCard({
               </span>
             </div>
           )}
-          {task.status === 'error' && !isFalReconnecting && (
+          {task.status === 'error' && !hasCompletedOutput && !isFalReconnecting && (
             <div className="flex flex-col items-center gap-1 px-2">
               <svg
                 className={`w-7 h-7 ${isInterrupted ? 'text-yellow-400' : 'text-red-400'}`}
@@ -476,7 +493,7 @@ export default function TaskCard({
               </span>
             </div>
           )}
-          {task.status === 'done' && thumbSrc && (
+          {hasCompletedOutput && thumbSrc && (
             <>
               <img
                 src={thumbSrc}
@@ -486,14 +503,19 @@ export default function TaskCard({
                 loading="lazy"
                 alt=""
               />
-              {task.outputImages.length > 1 && (
+              {isCompletedOutputError && (
+                <span className="absolute top-1.5 right-1.5 rounded bg-red-500 px-1.5 py-0.5 text-[10px] font-medium text-white backdrop-blur-sm sm:text-xs">
+                  {isPartialFailure ? '部分完成' : '失败'}
+                </span>
+              )}
+              {outputCountLabel && (
                 <span className="absolute bottom-1 right-1 bg-black/60 text-white text-xs px-1.5 py-0.5 rounded">
-                  {task.outputImages.length}
+                  {outputCountLabel}
                 </span>
               )}
             </>
           )}
-          {task.status === 'done' && !thumbSrc && (
+          {hasCompletedOutput && !thumbSrc && (
             <svg
               className="w-8 h-8 text-gray-300"
               fill="none"
@@ -510,7 +532,7 @@ export default function TaskCard({
           )}
           {/* 运行中显示耗时，完成后显示封面图比例与分辨率标签 */}
           <div className="absolute top-1.5 left-1.5 flex items-center gap-1">
-            {showRunningTimer || task.status !== 'done' || !coverRatio || !coverSize ? (
+            {showRunningTimer || (!hasCompletedOutput && task.status !== 'done') || !coverRatio || !coverSize ? (
               <span className="flex items-center gap-1 bg-black/50 text-white text-[10px] sm:text-xs px-1.5 py-0.5 rounded backdrop-blur-sm font-mono">
                 <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -541,6 +563,11 @@ export default function TaskCard({
             ) : (
               <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3">
                 {task.prompt || '(无提示词)'}
+              </p>
+            )}
+            {completedOutputErrorSummary && (
+              <p className="mt-1 text-xs leading-snug text-red-500 line-clamp-1" title={task.error || undefined}>
+                {completedOutputErrorSummary}
               </p>
             )}
           </div>

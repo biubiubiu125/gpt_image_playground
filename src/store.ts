@@ -45,9 +45,9 @@ import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
 import { showBrowserNotification } from './lib/browserNotification'
-import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
+import { IMAGE_FETCH_CORS_HINT, PARTIAL_IMAGE_FAILURE_PREFIX, type CallApiFinalImage } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
-import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
+import { getCustomQueuedImageResult, MAX_CONCURRENT_IMAGE_REQUESTS } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
@@ -245,7 +245,7 @@ function scheduleThumbnailBackfillTick() {
     void processNextThumbnailBackfill()
   }
 
-  if ('requestIdleCallback' in window) {
+  if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
     window.requestIdleCallback(run, { timeout: 2_000 })
   } else {
     globalThis.setTimeout(run, 250)
@@ -1671,6 +1671,32 @@ function putTask(task: TaskRecord): Promise<IDBValidKey> {
   return dbPutTask(getPersistableTask(task))
 }
 
+const taskPersistQueues = new Map<string, Promise<void>>()
+
+function enqueueTaskPersistence(taskId: string, operation: () => Promise<unknown>): Promise<void> {
+  const previous = taskPersistQueues.get(taskId) ?? Promise.resolve()
+  let next: Promise<void>
+  next = previous
+    .catch(() => undefined)
+    .then(operation)
+    .then(() => undefined)
+    .finally(() => {
+      if (taskPersistQueues.get(taskId) === next) taskPersistQueues.delete(taskId)
+    })
+  taskPersistQueues.set(taskId, next)
+  return next
+}
+
+function queuePutTask(task: TaskRecord) {
+  void enqueueTaskPersistence(task.id, () => putTask(task)).catch((err) => {
+    console.error(err)
+  })
+}
+
+function queueDeleteTask(taskId: string): Promise<void> {
+  return enqueueTaskPersistence(taskId, () => dbDeleteTask(taskId))
+}
+
 export function getCodexCliPromptKey(settings: AppSettings): string {
   const profile = getActiveApiProfile(settings)
   return `${profile.baseUrl}\n${profile.apiKey}`
@@ -1720,10 +1746,14 @@ function clearOpenAIWatchdogTimer(taskId: string) {
 function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.now()) {
   const task = useStore.getState().tasks.find((item) => item.id === taskId)
   if (!task || !isRunningOpenAITask(task)) return false
+  const completedCount = task.outputImages?.length ?? 0
+  const errorMessage = completedCount > 0
+    ? `${PARTIAL_IMAGE_FAILURE_PREFIX} ${completedCount}/${Math.max(task.params.n || 1, completedCount)} 张。\n${error}`
+    : error
 
   updateTaskInStore(taskId, {
     status: 'error',
-    error,
+    error: errorMessage,
     falRecoverable: false,
     finishedAt: now,
     elapsed: Math.max(0, now - task.createdAt),
@@ -1920,6 +1950,78 @@ function mapActualParamsByImage(outputIds: string[], paramsList: Array<Partial<T
     return acc
   }, {})
   return mapped && Object.keys(mapped).length > 0 ? mapped : undefined
+}
+
+function mergeOutputIdsPreservingExistingOrder(existingIds: string[], resultIds: string[]): string[] {
+  const resultIdSet = new Set(resultIds)
+  const merged = existingIds.filter((id) => resultIdSet.has(id))
+  const mergedSet = new Set(merged)
+  for (const id of resultIds) {
+    if (!mergedSet.has(id)) {
+      merged.push(id)
+      mergedSet.add(id)
+    }
+  }
+  return merged
+}
+
+type StoredFinalImage = {
+  id: string
+  image: string
+  actualParams?: Partial<TaskParams>
+  revisedPrompt?: string
+  rawImageUrl?: string
+  requestIndex?: number
+}
+
+function nonEmptyRecord<T>(record: Record<string, T>): Record<string, T> | undefined {
+  return Object.keys(record).length > 0 ? record : undefined
+}
+
+async function appendFinalImageToRunningTask(taskId: string, finalImage: CallApiFinalImage): Promise<StoredFinalImage | null> {
+  let imgId = ''
+
+  try {
+    imgId = await storeImage(finalImage.image, 'generated')
+    cacheImage(imgId, finalImage.image)
+
+    const latestTask = useStore.getState().tasks.find((task) => task.id === taskId)
+    if (!latestTask || latestTask.status !== 'running') {
+      await deleteUnreferencedImageIds([imgId])
+      return null
+    }
+
+    const actualParamsByImage = { ...(latestTask.actualParamsByImage ?? {}) }
+    if (hasActualParams(finalImage.actualParams)) actualParamsByImage[imgId] = finalImage.actualParams
+
+    const revisedPromptByImage = { ...(latestTask.revisedPromptByImage ?? {}) }
+    const revisedPrompt = finalImage.revisedPrompt?.trim()
+    if (revisedPrompt) revisedPromptByImage[imgId] = revisedPrompt
+
+    const rawImageUrls = finalImage.rawImageUrl
+      ? [...(latestTask.rawImageUrls ?? []), finalImage.rawImageUrl]
+      : latestTask.rawImageUrls
+
+    updateTaskInStore(taskId, {
+      outputImages: [...latestTask.outputImages, imgId],
+      actualParamsByImage: nonEmptyRecord(actualParamsByImage),
+      revisedPromptByImage: nonEmptyRecord(revisedPromptByImage),
+      rawImageUrls: rawImageUrls?.length ? rawImageUrls : undefined,
+    })
+
+    return {
+      id: imgId,
+      image: finalImage.image,
+      actualParams: finalImage.actualParams,
+      revisedPrompt,
+      rawImageUrl: finalImage.rawImageUrl,
+      requestIndex: finalImage.requestIndex,
+    }
+  } catch (err) {
+    if (imgId) await deleteUnreferencedImageIds([imgId])
+    console.error(err)
+    return null
+  }
 }
 
 async function readImageSizeParam(dataUrl: string): Promise<Partial<TaskParams> | undefined> {
@@ -3953,7 +4055,10 @@ async function executeTask(taskId: string) {
     : null
 
   if (taskProvider !== 'fal' && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
-    scheduleOpenAIWatchdog(taskId, activeProfile.timeout, activeProfile)
+    const watchdogTimeout = taskProvider === 'openai' && task.params.n > 1
+      ? activeProfile.timeout * Math.ceil(task.params.n / MAX_CONCURRENT_IMAGE_REQUESTS)
+      : activeProfile.timeout
+    scheduleOpenAIWatchdog(taskId, watchdogTimeout, activeProfile)
   }
 
   try {
@@ -3970,6 +4075,7 @@ async function executeTask(taskId: string) {
       if (!maskDataUrl) throw new Error('遮罩图片已不存在')
     }
 
+    const storedFinalImages: StoredFinalImage[] = []
     const result = await callImageApi({
       settings: requestSettings,
       prompt: replaceImageMentionsForApi(task.prompt, inputDataUrls.length),
@@ -3995,6 +4101,10 @@ async function executeTask(taskId: string) {
         useStore.getState().setTaskStreamPreview(taskId, partial.image, partial.requestIndex)
         void persistTaskStreamPartialImage(taskId, partial.image)
       },
+      onFinalImage: async (finalImage) => {
+        const stored = await appendFinalImageToRunningTask(taskId, finalImage)
+        if (stored) storedFinalImages.push(stored)
+      },
     })
 
     const latestBeforeSuccess = useStore.getState().tasks.find((t) => t.id === taskId)
@@ -4004,11 +4114,27 @@ async function executeTask(taskId: string) {
     }
 
     // 存储输出图片
-    const outputIds: string[] = []
-    for (const dataUrl of result.images) {
-      const imgId = await storeImage(dataUrl, 'generated')
-      cacheImage(imgId, dataUrl)
-      outputIds.push(imgId)
+    const storedByDataUrl = new Map<string, StoredFinalImage[]>()
+    for (const stored of storedFinalImages) {
+      const queue = storedByDataUrl.get(stored.image) ?? []
+      queue.push(stored)
+      storedByDataUrl.set(stored.image, queue)
+    }
+    const resultOutputIds: string[] = []
+    const rawImageUrlById = new Map<string, string>()
+    for (const [index, dataUrl] of result.images.entries()) {
+      const storedQueue = storedByDataUrl.get(dataUrl)
+      const stored = storedQueue?.shift()
+      const rawImageUrl = stored?.rawImageUrl || result.rawImageUrls?.[index]
+      if (stored) {
+        resultOutputIds.push(stored.id)
+        if (rawImageUrl) rawImageUrlById.set(stored.id, rawImageUrl)
+      } else {
+        const imgId = await storeImage(dataUrl, 'generated')
+        cacheImage(imgId, dataUrl)
+        resultOutputIds.push(imgId)
+        if (rawImageUrl) rawImageUrlById.set(imgId, rawImageUrl)
+      }
     }
     const isAsyncCustomTask = taskProvider !== 'fal' && taskProvider !== 'openai' && Boolean(customTaskInfo)
     const actualParamsList = taskProvider === 'fal'
@@ -4019,12 +4145,12 @@ async function executeTask(taskId: string) {
     const actualParams = (() => {
       if (taskProvider === 'fal') return firstActualParams(actualParamsList)
       if (isAsyncCustomTask) return firstActualParams(actualParamsList)
-      return { ...result.actualParams, n: outputIds.length }
+      return { ...result.actualParams, n: resultOutputIds.length }
     })()
     const shouldStoreRevisedPrompts = taskProvider !== 'fal' && !isAsyncCustomTask
-    const actualParamsByImage = mapActualParamsByImage(outputIds, actualParamsList)
+    const actualParamsByImage = mapActualParamsByImage(resultOutputIds, actualParamsList)
     const revisedPromptByImage = shouldStoreRevisedPrompts ? result.revisedPrompts?.reduce<Record<string, string>>((acc, revisedPrompt, index) => {
-      const imgId = outputIds[index]
+      const imgId = resultOutputIds[index]
       if (imgId && revisedPrompt && revisedPrompt.trim()) acc[imgId] = revisedPrompt
       return acc
     }, {}) : undefined
@@ -4047,16 +4173,24 @@ async function executeTask(taskId: string) {
       return
     }
     const partialImageIdsToClean = latestBeforeUpdate.streamPartialImageIds || []
+    const outputIds = mergeOutputIdsPreservingExistingOrder(latestBeforeUpdate.outputImages, resultOutputIds)
+    const rawImageUrls = outputIds
+      .map((id) => rawImageUrlById.get(id))
+      .filter((url): url is string => Boolean(url))
+    const isPartialFailure = Boolean(result.failedImageCount && result.failedImageCount > 0)
+    const requestedImageCount = result.requestedImageCount ?? task.params.n
+    const partialError = result.partialError || `${PARTIAL_IMAGE_FAILURE_PREFIX} ${outputIds.length}/${requestedImageCount} 张。`
     clearOpenAIWatchdogTimer(taskId)
     useStore.getState().setTaskStreamPreview(taskId)
     updateTaskInStore(taskId, {
       outputImages: outputIds,
       streamPartialImageIds: undefined,
-      rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      rawImageUrls: rawImageUrls.length ? rawImageUrls : undefined,
       actualParams,
       actualParamsByImage,
       revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
-      status: 'done',
+      status: isPartialFailure ? 'error' : 'done',
+      error: isPartialFailure ? partialError : null,
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
       falRecoverable: false,
@@ -4064,8 +4198,14 @@ async function executeTask(taskId: string) {
     })
     void deleteUnreferencedImageIds(partialImageIdsToClean)
 
-    useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
-    if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${outputIds.length} 张图片。`)
+    if (isPartialFailure) {
+      useStore.getState().showToast(partialError, 'error')
+      useStore.getState().setDetailTaskId(taskId)
+      if (!isAgentTask(task)) showTaskCompletionNotification('图像生成部分完成', partialError)
+    } else {
+      useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
+      if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${outputIds.length} 张图片。`)
+    }
     const currentMask = useStore.getState().maskDraft
     if (
       maskDataUrl &&
@@ -4163,7 +4303,7 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
   const task = updated.find((t) => t.id === taskId)
   setTasks(updated)
   maybeOpenSupportPrompt(tasks, updated, taskId)
-  if (task) putTask(task)
+  if (task) queuePutTask(task)
 }
 
 function normalizeFavoriteCollectionIds(ids: unknown) {
@@ -4459,7 +4599,7 @@ export async function removeMultipleTasks(taskIds: string[]) {
 
   setTasks(remaining)
   for (const id of taskIds) {
-    await dbDeleteTask(id)
+    await queueDeleteTask(id)
   }
 
   // 找出其他任务仍引用的图片
@@ -4504,7 +4644,7 @@ export async function removeTask(task: TaskRecord) {
   // 从列表移除
   const remaining = await scrubAgentOutputPayloadsForDeletedTasks([task], tasks.filter((t) => t.id !== task.id))
   setTasks(remaining)
-  await dbDeleteTask(task.id)
+  await queueDeleteTask(task.id)
 
   // 找出其他任务仍引用的图片
   const stillUsed = new Set<string>()
