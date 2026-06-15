@@ -2009,7 +2009,7 @@ describe('reused task API profile', () => {
     const state = useStore.getState()
     expect(state.settings.activeProfileId).toBe(openaiProfile.id)
     expect(state.reusedTaskApiProfileId).toBe(falProfile.id)
-    expect(state.params).toMatchObject({ n: 4, size: '1360x1024', quality: 'high' })
+    expect(state.params).toMatchObject({ n: 8, size: 'auto', quality: 'auto' })
     expect(state.showToast).toHaveBeenCalledWith(`已临时复用该任务的 API 配置「${RK_API_PROFILE_NAME}」`, 'success')
   })
 

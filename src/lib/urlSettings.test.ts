@@ -23,7 +23,7 @@ describe('URL settings params', () => {
     expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
       name: RK_API_PROFILE_NAME,
       provider: 'openai',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'test-key',
       model: DEFAULT_IMAGES_MODEL,
     })
@@ -38,7 +38,7 @@ describe('URL settings params', () => {
 
     expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
       provider: 'openai',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'test-key',
       model: 'custom-image-model',
       apiMode: 'images',
@@ -63,7 +63,7 @@ describe('URL settings params', () => {
     const existingProfile = createDefaultOpenAIProfile({
       id: 'existing-openai',
       name: 'Existing OpenAI',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'test-key',
     })
     const current = normalizeSettings({
@@ -84,7 +84,7 @@ describe('URL settings params', () => {
     const existingProfile = createDefaultOpenAIProfile({
       id: 'existing-openai',
       name: 'Existing OpenAI',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'test-key',
       streamImages: true,
       streamPartialImages: 0,
@@ -104,7 +104,7 @@ describe('URL settings params', () => {
     expect(next.activeProfileId).not.toBe(existingProfile.id)
     expect(activeProfile).toMatchObject({
       provider: 'openai',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'test-key',
       streamImages: true,
       streamPartialImages: 3,
@@ -126,7 +126,7 @@ describe('URL settings params', () => {
     expect(next.profiles).toHaveLength(2)
     expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
       provider: 'openai',
-      baseUrl: 'https://api.example.com/v1',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'openai-key',
     })
   })
@@ -140,7 +140,7 @@ describe('URL settings params', () => {
     expect(params.toString()).toBe('foo=bar')
   })
 
-  it('imports settings with custom providers from URL params', () => {
+  it('normalizes custom provider settings from URL params to locked OpenAI profiles', () => {
     const importedSettings = {
       customProviders: [{
         id: 'custom-json',
@@ -157,7 +157,7 @@ describe('URL settings params', () => {
         id: 'custom-profile',
         name: 'Custom Profile',
         provider: 'custom-json',
-        baseUrl: 'https://api.example.com/v1',
+        baseUrl: DEFAULT_SETTINGS.baseUrl,
         apiKey: 'custom-key',
         model: 'custom-model',
         timeout: 300,
@@ -174,14 +174,14 @@ describe('URL settings params', () => {
       ...buildSettingsFromUrlParams(DEFAULT_SETTINGS, params),
     })
 
-    expect(next.customProviders).toHaveLength(1)
-    expect(next.customProviders[0]).toMatchObject({ id: 'custom-json', name: 'Custom JSON' })
+    expect(next.customProviders).toHaveLength(0)
     expect(next.activeProfileId).toBe('custom-profile')
     expect(next.profiles[0]).toMatchObject({
       id: 'custom-profile',
-      provider: 'custom-json',
+      provider: 'openai',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'custom-key',
-      model: 'custom-model',
+      model: DEFAULT_IMAGES_MODEL,
     })
   })
 
@@ -213,7 +213,7 @@ describe('URL settings params', () => {
         id: 'custom-profile',
         name: 'Custom Profile',
         provider: 'custom-json',
-        baseUrl: 'https://api.example.com/v1',
+        baseUrl: DEFAULT_SETTINGS.baseUrl,
         apiKey: 'custom-key',
         model: 'custom-model',
         timeout: 300,
@@ -233,14 +233,14 @@ describe('URL settings params', () => {
 
     expect(next.activeProfileId).not.toBe('current-openai')
     expect(activeProfile).toMatchObject({
-      provider: 'custom-json',
-      baseUrl: 'https://api.example.com/v1',
+      provider: 'openai',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'custom-key',
-      model: 'custom-model',
+      model: DEFAULT_IMAGES_MODEL,
     })
   })
 
-  it('imports custom provider settings wrapper from URL params', () => {
+  it('normalizes wrapped custom provider settings from URL params', () => {
     const params = new URLSearchParams()
     params.set('settings', JSON.stringify({
       version: 1,
@@ -260,7 +260,7 @@ describe('URL settings params', () => {
           id: 'wrapped-profile',
           name: 'Wrapped Profile',
           provider: 'wrapped-custom',
-          baseUrl: 'https://wrapped.example.com/v1',
+          baseUrl: DEFAULT_SETTINGS.baseUrl,
           apiKey: 'wrapped-key',
           model: 'wrapped-model',
           timeout: 300,
@@ -276,15 +276,14 @@ describe('URL settings params', () => {
       ...buildSettingsFromUrlParams(DEFAULT_SETTINGS, params),
     })
 
-    expect(next.customProviders).toHaveLength(1)
-    expect(next.customProviders[0]).toMatchObject({ id: 'wrapped-custom', name: 'Wrapped Custom' })
+    expect(next.customProviders).toHaveLength(0)
     expect(next.profiles).toHaveLength(1)
     expect(next.profiles[0]).toMatchObject({
       id: 'wrapped-profile',
-      provider: 'wrapped-custom',
-      baseUrl: 'https://wrapped.example.com/v1',
+      provider: 'openai',
+      baseUrl: DEFAULT_SETTINGS.baseUrl,
       apiKey: 'wrapped-key',
-      model: 'wrapped-model',
+      model: DEFAULT_IMAGES_MODEL,
     })
   })
 })

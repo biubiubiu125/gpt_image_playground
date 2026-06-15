@@ -1817,6 +1817,7 @@ export function getTaskApiProfile(settings: AppSettings, task: TaskRecord): ApiP
 
   const byId = normalized.profiles.find((profile) => profile.id === task.apiProfileId)
   if (byId && (!provider || byId.provider === provider)) return byId
+  if (byId && byId.provider === 'openai' && provider !== 'openai') return byId
   return null
 }
 

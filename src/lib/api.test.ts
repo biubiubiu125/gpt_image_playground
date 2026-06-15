@@ -539,7 +539,7 @@ describe('callImageApi', () => {
     )
   })
 
-  it('uses the same-origin API proxy path for sync custom providers', async () => {
+  it('normalizes sync custom provider profiles to the standard API proxy path', async () => {
     vi.stubEnv('VITE_API_PROXY_AVAILABLE', 'true')
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       data: [{ b64_json: 'aW1hZ2U=' }],
@@ -583,16 +583,21 @@ describe('callImageApi', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api-proxy/custom/images',
+      '/api-proxy/images/generations',
       expect.objectContaining({ method: 'POST' }),
     )
   })
 
-  it('rejects API proxy for async custom providers', async () => {
+  it('normalizes async custom provider profiles before API proxy dispatch', async () => {
     vi.stubEnv('VITE_API_PROXY_AVAILABLE', 'true')
-    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      data: [{ b64_json: 'aW1hZ2U=' }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
 
-    await expect(callImageApi({
+    await callImageApi({
       settings: {
         ...DEFAULT_SETTINGS,
         baseUrl: '',
@@ -633,9 +638,12 @@ describe('callImageApi', () => {
       prompt: 'prompt',
       params: { ...DEFAULT_PARAMS },
       inputImageDataUrls: [],
-    })).rejects.toThrow('异步任务的自定义服务商')
+    })
 
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api-proxy/images/generations',
+      expect.objectContaining({ method: 'POST' }),
+    )
   })
 
   it('uses the same-origin API proxy path when API proxy is locked', async () => {
@@ -710,27 +718,17 @@ describe('callImageApi', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://api.example.com/v1/images/generations',
+      `${DEFAULT_SETTINGS.baseUrl}/v1/images/generations`,
       expect.objectContaining({ method: 'POST' }),
     )
   })
 
-  it('polls custom async tasks immediately and keeps polling after transient network errors', async () => {
+  it('normalizes custom async task profiles to the standard Images API request path', async () => {
     vi.useFakeTimers()
     const onCustomTaskEnqueued = vi.fn()
     const fetchMock = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'task-1' }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }))
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        data: {
-          status: 'SUCCESS',
-          data: {
-            data: [{ b64_json: 'aW1hZ2U=' }],
-          },
-        },
+        data: [{ b64_json: 'aW1hZ2U=' }],
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -783,35 +781,19 @@ describe('callImageApi', () => {
       onCustomTaskEnqueued,
     })
 
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    expect(onCustomTaskEnqueued).toHaveBeenCalledWith({ taskId: 'task-1' })
-    expect(fetchMock.mock.calls[1][0]).toBe('https://api.example.com/v1/images/tasks/task-1')
-    await vi.advanceTimersByTimeAsync(1000)
-
-    await expect(promise).resolves.toEqual({
+    await expect(promise).resolves.toMatchObject({
       images: ['data:image/png;base64,aW1hZ2U='],
     })
-    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(onCustomTaskEnqueued).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toBe(`${DEFAULT_SETTINGS.baseUrl}/v1/images/generations`)
   })
 
-  it('does not apply submit timeout to custom async polling after receiving a task id', async () => {
+  it('applies normal submit parsing after custom async profiles are normalized', async () => {
     vi.useFakeTimers()
     vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'task-1' }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: { status: 'IN_PROGRESS' } }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        data: {
-          status: 'SUCCESS',
-          data: {
-            data: [{ b64_json: 'aW1hZ2U=' }],
-          },
-        },
+        data: [{ b64_json: 'aW1hZ2U=' }],
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -862,9 +844,7 @@ describe('callImageApi', () => {
       inputImageDataUrls: [],
     })
 
-    await vi.advanceTimersByTimeAsync(6000)
-
-    await expect(promise).resolves.toEqual({
+    await expect(promise).resolves.toMatchObject({
       images: ['data:image/png;base64,aW1hZ2U='],
     })
   })
